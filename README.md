@@ -1,2 +1,0 @@
-# pogodnik
-42
