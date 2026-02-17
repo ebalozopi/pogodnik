@@ -7,24 +7,32 @@ import (
 	"math"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"pogodnik/monitor"
-	_"github.com/joho/godotenv/autoload"
+	"pogodnik/services"
+	"pogodnik/storage"
 
+	"github.com/xuri/excelize/v2"
 	tele "gopkg.in/telebot.v3"
+	"gorm.io/gorm"
+	
+	 _ "github.com/joho/godotenv/autoload"
 )
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Configuration
+// ═══════════════════════════════════════════════════════════════════════════
+
 type Config struct {
-	TelegramToken   string
-	ChatIDs         []int64
-	PollInterval    time.Duration
-	ChangeThreshold float64
+	TelegramToken string
+	ChatIDs       []int64
+	PollInterval  time.Duration
+	DBPath        string
+	AVWXToken     string
 }
 
 func LoadConfig() (*Config, error) {
@@ -59,580 +67,90 @@ func LoadConfig() (*Config, error) {
 		pollSec = 60
 	}
 
-	threshold, _ := strconv.ParseFloat(os.Getenv("CHANGE_THRESHOLD_C"), 64)
-	if threshold <= 0 {
-		threshold = 0.5
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "pogodnik.db"
 	}
 
 	return &Config{
-		TelegramToken:   token,
-		ChatIDs:         chatIDs,
-		PollInterval:    time.Duration(pollSec) * time.Second,
-		ChangeThreshold: threshold,
+		TelegramToken: token,
+		ChatIDs:       chatIDs,
+		PollInterval:  time.Duration(pollSec) * time.Second,
+		DBPath:        dbPath,
+		AVWXToken:     os.Getenv("AVWX_TOKEN"),
 	}, nil
 }
 
-type PreviousObs struct {
-	TempC      float64
-	WindSpeed  int
-	WindDir    int
-	Visibility string
-}
-
-type ObsCache struct {
-	mu    sync.RWMutex
-	cache map[string]PreviousObs
-}
-
-func NewObsCache() *ObsCache {
-	return &ObsCache{cache: make(map[string]PreviousObs)}
-}
-
-func (oc *ObsCache) Get(icao string) (PreviousObs, bool) {
-	oc.mu.RLock()
-	defer oc.mu.RUnlock()
-	obs, ok := oc.cache[icao]
-	return obs, ok
-}
-
-func (oc *ObsCache) Set(icao string, obs PreviousObs) {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-	oc.cache[icao] = obs
-}
-
-func (oc *ObsCache) HasSignificantChange(icao string, newObs *monitor.Observation, threshold float64) bool {
-	prev, exists := oc.Get(icao)
-	if !exists {
-		return true
-	}
-
-	if math.Abs(newObs.TempCelsius-prev.TempC) >= threshold {
-		return true
-	}
-
-	if abs(newObs.WindSpeed-prev.WindSpeed) >= 5 {
-		return true
-	}
-
-	if prev.WindDir >= 0 && newObs.WindDir >= 0 {
-		dirDelta := abs(newObs.WindDir - prev.WindDir)
-		if dirDelta > 180 {
-			dirDelta = 360 - dirDelta
-		}
-		if dirDelta >= 30 {
-			return true
-		}
-	}
-
-	if newObs.Visibility != prev.Visibility {
-		return true
-	}
-
-	return false
-}
-
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// Bot application
+// ═══════════════════════════════════════════════════════════════════════════
 
 type App struct {
-	config   *Config
-	bot      *tele.Bot
-	airports map[string]monitor.Airport
-	states   map[string]*monitor.WeatherState
-	pressure map[string]*monitor.PressureTracker
-	obsCache *ObsCache
-
-	reportChan chan ReportRequest
-	notifyChan chan *monitor.Report
-	stopChan   chan struct{}
-	wg         sync.WaitGroup
-}
-
-type ReportRequest struct {
-	ChatID   int64
-	SingleAP string
+	cfg    *Config
+	db     *gorm.DB
+	bot    *tele.Bot
+	engine *monitor.Engine
 }
 
 func NewApp(cfg *Config) (*App, error) {
-	pref := tele.Settings{
+	// ── Database ────────────────────────────────────────────────────────
+
+	db, err := storage.InitDB(cfg.DBPath)
+	if err != nil {
+		return nil, fmt.Errorf("init db: %w", err)
+	}
+	log.Printf("✓ Database opened: %s", cfg.DBPath)
+
+	// Seed the hardcoded airports so the bot works out of the box.
+	if err := storage.SeedAirports(db, services.HardcodedList()); err != nil {
+		return nil, fmt.Errorf("seed airports: %w", err)
+	}
+	log.Println("✓ Default airports seeded")
+
+	// ── Telegram bot ────────────────────────────────────────────────────
+
+	bot, err := tele.NewBot(tele.Settings{
 		Token:  cfg.TelegramToken,
 		Poller: &tele.LongPoller{Timeout: 30 * time.Second},
-	}
-
-	bot, err := tele.NewBot(pref)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("create bot: %w", err)
 	}
-
-	airports, states := monitor.InitConfig()
-	airportList := make([]monitor.Airport, 0, len(airports))
-	for _, a := range airports {
-		airportList = append(airportList, a)
-	}
+	log.Println("✓ Telegram bot created")
 
 	app := &App{
-		config:     cfg,
-		bot:        bot,
-		airports:   airports,
-		states:     states,
-		pressure:   monitor.NewPressureTrackers(airportList, 60),
-		obsCache:   NewObsCache(),
-		reportChan: make(chan ReportRequest, 10),
-		notifyChan: make(chan *monitor.Report, 50),
-		stopChan:   make(chan struct{}),
+		cfg: cfg,
+		db:  db,
+		bot: bot,
 	}
 
 	app.registerHandlers()
 	return app, nil
 }
 
-type HourlyOutlook struct {
-	Hour        string
-	TempDisplay string
-}
-
-type DailyOutlook struct {
-	Hours        []HourlyOutlook
-	ExpectedHigh string
-	ExpectedLow  string
-}
-
-func FetchDailyOutlook(ctx context.Context, apt monitor.Airport) (*DailyOutlook, error) {
-	times, temps, err := monitor.FetchExtendedForecast(ctx, apt)
-	if err != nil {
-		return nil, err
-	}
-
-	loc, err := time.LoadLocation(apt.Timezone)
-	if err != nil {
-		return nil, err
-	}
-
-	now := time.Now().In(loc)
-	today := now.Format("2006-01-02")
-
-	var outlook DailyOutlook
-	var todayTemps []float64
-
-	for i, ts := range times {
-		if !strings.HasPrefix(ts, today) {
-			continue
-		}
-
-		parsed, err := time.ParseInLocation("2006-01-02T15:04", ts, loc)
-		if err != nil {
-			continue
-		}
-
-		if parsed.Before(now) {
-			continue
-		}
-
-		if i < len(temps) {
-			temp := temps[i]
-			todayTemps = append(todayTemps, temp)
-
-			if len(outlook.Hours) < 6 {
-				outlook.Hours = append(outlook.Hours, HourlyOutlook{
-					Hour:        parsed.Format("15:04"),
-					TempDisplay: monitor.FormatTemp(temp),
-				})
-			}
-		}
-	}
-
-	if len(todayTemps) > 0 {
-		sort.Float64s(todayTemps)
-		outlook.ExpectedLow = monitor.FormatTemp(todayTemps[0])
-		outlook.ExpectedHigh = monitor.FormatTemp(todayTemps[len(todayTemps)-1])
-	}
-
-	return &outlook, nil
-}
-
-func FormatTelegramMessage(r *monitor.Report, forecast *DailyOutlook) string {
-	var b strings.Builder
-	b.Grow(1500)
-
-	b.WriteString("🛫 *")
-	b.WriteString(escapeMarkdown(r.Airport.City))
-	b.WriteString(" (")
-	b.WriteString(r.Airport.ICAO)
-	b.WriteString(")*\n")
-	b.WriteString("🕐 ")
-	b.WriteString(r.LocalTime.Format("Mon, 02 Jan 2006 15:04 MST"))
-	b.WriteString("\n\n")
-
-	b.WriteString("📡 *REAL-TIME CONDITIONS*\n")
-	b.WriteString("```\n")
-	fmt.Fprintf(&b, "Temperature : %s\n", r.Observation.TempDisplay)
-	fmt.Fprintf(&b, "Wind        : %s\n", r.Observation.Wind)
-	fmt.Fprintf(&b, "Visibility  : %s\n", r.Observation.Visibility)
-	if r.Pressure.Available {
-		fmt.Fprintf(&b, "Pressure    : %s\n", r.Pressure.Display)
-	}
-	b.WriteString("```\n\n")
-
-	b.WriteString("📊 *DAY STATISTICS* (")
-	b.WriteString(r.Extremes.TrackingDay.Format("02 Jan"))
-	b.WriteString(")\n")
-	b.WriteString("```\n")
-	if math.IsInf(r.Extremes.HighC, 0) {
-		b.WriteString("Awaiting first observation...\n")
-	} else {
-		fmt.Fprintf(&b, "High (ATH)  : %s\n", r.Extremes.HighDisplay)
-		fmt.Fprintf(&b, "Low  (ATL)  : %s\n", r.Extremes.LowDisplay)
-	}
-	b.WriteString("```\n\n")
-
-	b.WriteString("🎯 *FORECAST vs REALITY*\n")
-	if r.Comparison.Available {
-		b.WriteString("```\n")
-		fmt.Fprintf(&b, "Forecast    : %s\n", r.Forecast.TempDisplay)
-		fmt.Fprintf(&b, "Reality     : %s\n", r.Observation.TempDisplay)
-		fmt.Fprintf(&b, "Delta       : %s\n", r.Comparison.DeltaDisplay)
-		fmt.Fprintf(&b, "Verdict     : %s (%s)\n", r.Comparison.Accuracy, r.Comparison.Narrative)
-		b.WriteString("```\n\n")
-	} else {
-		b.WriteString("_Forecast data not available_\n\n")
-	}
-
-	b.WriteString("🌤 *DAILY OUTLOOK*\n")
-	if forecast != nil && len(forecast.Hours) > 0 {
-		b.WriteString("```\n")
-		for _, h := range forecast.Hours {
-			fmt.Fprintf(&b, "%s : %s\n", h.Hour, h.TempDisplay)
-		}
-		if forecast.ExpectedHigh != "" {
-			fmt.Fprintf(&b, "\nExp. High   : %s\n", forecast.ExpectedHigh)
-			fmt.Fprintf(&b, "Exp. Low    : %s\n", forecast.ExpectedLow)
-		}
-		b.WriteString("```\n")
-	} else {
-		b.WriteString("_Outlook not available_\n")
-	}
-
-	b.WriteString("\n📋 _Raw METAR:_\n`")
-	b.WriteString(escapeMarkdown(r.Observation.RawMETAR))
-	b.WriteString("`")
-
-	return b.String()
-}
-
-func escapeMarkdown(s string) string {
-	replacer := strings.NewReplacer(
-		"_", "\\_",
-		"*", "\\*",
-		"[", "\\[",
-		"]", "\\]",
-		"(", "\\(",
-		")", "\\)",
-		"~", "\\~",
-		"`", "\\`",
-		">", "\\>",
-		"#", "\\#",
-		"+", "\\+",
-		"-", "\\-",
-		"=", "\\=",
-		"|", "\\|",
-		"{", "\\{",
-		"}", "\\}",
-		".", "\\.",
-		"!", "\\!",
-	)
-	return replacer.Replace(s)
-}
-
-// handleWelcome is the shared handler for both /start and /help.
-func (app *App) handleWelcome(c tele.Context) error {
-	welcome := `🌤 *Aviation Weather Monitor*
-
-Welcome! I track real-time weather conditions at major airports worldwide.
-
-*Available Commands:*
-• /report - Get current weather for all airports
-• /airport ICAO - Get weather for specific airport
-• /status - Check bot status
-• /help - Show this help message
-
-*Monitored Airports:*
-` + app.getAirportList()
-
-	return c.Send(welcome, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
-}
-
-func (app *App) registerHandlers() {
-	// /start and /help both use the same handler
-	app.bot.Handle("/start", app.handleWelcome)
-	app.bot.Handle("/help", app.handleWelcome)
-
-	app.bot.Handle("/report", func(c tele.Context) error {
-		_ = c.Send("📡 Fetching weather data for all airports...")
-
-		app.reportChan <- ReportRequest{
-			ChatID:   c.Chat().ID,
-			SingleAP: "",
-		}
-		return nil
-	})
-
-	app.bot.Handle("/airport", func(c tele.Context) error {
-		args := strings.Fields(c.Message().Payload)
-		if len(args) == 0 {
-			return c.Send("Usage: /airport ICAO (e.g., /airport KORD)")
-		}
-
-		icao := strings.ToUpper(args[0])
-		if _, exists := app.airports[icao]; !exists {
-			return c.Send(fmt.Sprintf("❌ Airport %s is not monitored.\n\n%s", icao, app.getAirportList()))
-		}
-
-		_ = c.Send(fmt.Sprintf("📡 Fetching weather for %s...", icao))
-
-		app.reportChan <- ReportRequest{
-			ChatID:   c.Chat().ID,
-			SingleAP: icao,
-		}
-		return nil
-	})
-
-	app.bot.Handle("/status", func(c tele.Context) error {
-		var active int
-		var lastUpdates []string
-
-		for icao, state := range app.states {
-			snap := state.Snapshot()
-			if !snap.LastUpdated.IsZero() {
-				active++
-				age := time.Since(snap.LastUpdated).Round(time.Second)
-				lastUpdates = append(lastUpdates, fmt.Sprintf("%s: %s ago", icao, age))
-			}
-		}
-
-		sort.Strings(lastUpdates)
-
-		status := fmt.Sprintf(`📊 *Bot Status*
-
-• Monitored Airports: %d
-• Active Data Feeds: %d
-• Poll Interval: %s
-• Change Threshold: %.1f°C
-
-*Last Updates:*
-%s`,
-			len(app.airports),
-			active,
-			app.config.PollInterval,
-			app.config.ChangeThreshold,
-			strings.Join(lastUpdates, "\n"),
-		)
-
-		return c.Send(status, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
-	})
-}
-
-func (app *App) getAirportList() string {
-	var lines []string
-	for icao, apt := range app.airports {
-		lines = append(lines, fmt.Sprintf("• %s - %s", icao, apt.City))
-	}
-	sort.Strings(lines)
-	return strings.Join(lines, "\n")
-}
-
-func (app *App) startAirportPoller(apt monitor.Airport) {
-	app.wg.Add(1)
-	go func() {
-		defer app.wg.Done()
-
-		log.Printf("[%s] Starting poller", apt.ICAO)
-
-		time.Sleep(time.Duration(len(apt.ICAO)*100) * time.Millisecond)
-		app.pollAirport(apt, true)
-
-		ticker := time.NewTicker(app.config.PollInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				app.pollAirport(apt, false)
-			case <-app.stopChan:
-				log.Printf("[%s] Poller stopped", apt.ICAO)
-				return
-			}
-		}
-	}()
-}
-
-func (app *App) pollAirport(apt monitor.Airport, forceNotify bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	obs, err := monitor.FetchMETAR(ctx, apt.ICAO)
-	if err != nil {
-		log.Printf("[%s] METAR error: %v", apt.ICAO, err)
-		return
-	}
-
-	if hpa, ok := monitor.ParsePressure(obs.Raw); ok {
-		app.pressure[apt.ICAO].Record(time.Now(), hpa)
-	}
-
-	if err := app.states[apt.ICAO].Update(obs.TempCelsius, apt); err != nil {
-		log.Printf("[%s] State error: %v", apt.ICAO, err)
-		return
-	}
-
-	hasChange := app.obsCache.HasSignificantChange(apt.ICAO, obs, app.config.ChangeThreshold)
-
-	app.obsCache.Set(apt.ICAO, PreviousObs{
-		TempC:      obs.TempCelsius,
-		WindSpeed:  obs.WindSpeed,
-		WindDir:    obs.WindDir,
-		Visibility: obs.Visibility,
-	})
-
-	if !hasChange && !forceNotify {
-		return
-	}
-
-	var fc *monitor.HourlyForecast
-	fc, _ = monitor.FetchForecast(ctx, apt)
-
-	snapshot := app.states[apt.ICAO].Snapshot()
-	report := monitor.AnalyzeWeather(apt, obs, fc, snapshot, app.pressure[apt.ICAO])
-
-	select {
-	case app.notifyChan <- report:
-		log.Printf("[%s] Notification queued", apt.ICAO)
-	default:
-		log.Printf("[%s] Channel full", apt.ICAO)
-	}
-}
-
-func (app *App) startReportHandler() {
-	app.wg.Add(1)
-	go func() {
-		defer app.wg.Done()
-
-		for {
-			select {
-			case req := <-app.reportChan:
-				app.handleReportRequest(req)
-			case <-app.stopChan:
-				return
-			}
-		}
-	}()
-}
-
-func (app *App) handleReportRequest(req ReportRequest) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	var airportsToFetch []monitor.Airport
-	if req.SingleAP != "" {
-		if apt, ok := app.airports[req.SingleAP]; ok {
-			airportsToFetch = []monitor.Airport{apt}
-		}
-	} else {
-		for _, apt := range app.airports {
-			airportsToFetch = append(airportsToFetch, apt)
-		}
-	}
-
-	sort.Slice(airportsToFetch, func(i, j int) bool {
-		return airportsToFetch[i].ICAO < airportsToFetch[j].ICAO
-	})
-
-	for _, apt := range airportsToFetch {
-		obs, err := monitor.FetchMETAR(ctx, apt.ICAO)
-		if err != nil {
-			app.sendToChat(req.ChatID, fmt.Sprintf("❌ %s: %v", apt.ICAO, err))
-			continue
-		}
-
-		_ = app.states[apt.ICAO].Update(obs.TempCelsius, apt)
-		if hpa, ok := monitor.ParsePressure(obs.Raw); ok {
-			app.pressure[apt.ICAO].Record(time.Now(), hpa)
-		}
-
-		fc, _ := monitor.FetchForecast(ctx, apt)
-		outlook, _ := FetchDailyOutlook(ctx, apt)
-
-		snapshot := app.states[apt.ICAO].Snapshot()
-		report := monitor.AnalyzeWeather(apt, obs, fc, snapshot, app.pressure[apt.ICAO])
-
-		msg := FormatTelegramMessage(report, outlook)
-		app.sendToChat(req.ChatID, msg)
-
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func (app *App) startNotificationDispatcher() {
-	app.wg.Add(1)
-	go func() {
-		defer app.wg.Done()
-
-		for {
-			select {
-			case report := <-app.notifyChan:
-				app.dispatchNotification(report)
-			case <-app.stopChan:
-				return
-			}
-		}
-	}()
-}
-
-func (app *App) dispatchNotification(report *monitor.Report) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	outlook, _ := FetchDailyOutlook(ctx, report.Airport)
-	msg := FormatTelegramMessage(report, outlook)
-
-	for _, chatID := range app.config.ChatIDs {
-		app.sendToChat(chatID, msg)
-	}
-}
-
-func (app *App) sendToChat(chatID int64, msg string) {
-	chat := &tele.Chat{ID: chatID}
-	_, err := app.bot.Send(chat, msg, &tele.SendOptions{
-		ParseMode:             tele.ModeMarkdown,
-		DisableWebPagePreview: true,
-	})
-	if err != nil {
-		log.Printf("Send error to %d: %v", chatID, err)
-	}
-}
-
+// Run starts the engine and bot, blocks until a signal is received.
 func (app *App) Run() error {
-	log.Println("Starting Pogodnik...")
+	// ── Start monitoring engine ─────────────────────────────────────────
 
-	app.startNotificationDispatcher()
-	app.startReportHandler()
+	app.engine = monitor.StartMonitoring(app.db, app.bot, app.cfg.ChatIDs)
+	log.Println("✓ Monitoring engine started")
 
-	for _, apt := range app.airports {
-		app.startAirportPoller(apt)
+	// ── Start bot (non-blocking) ────────────────────────────────────────
+
+	go func() {
+		log.Println("✓ Telegram bot polling...")
+		app.bot.Start()
+	}()
+
+	// ── Notify chats ────────────────────────────────────────────────────
+
+	for _, chatID := range app.cfg.ChatIDs {
+		app.sendToChat(chatID, "🟢 *Pogodnik v2\\.0 Online*\n\nType /help for commands\\.")
 	}
-	log.Printf("Started %d airport pollers", len(app.airports))
 
-	go app.bot.Start()
+	log.Println("✓ All systems operational")
 
-	for _, chatID := range app.config.ChatIDs {
-		app.sendToChat(chatID, "🟢 *Pogodnik Online*\n\nType /help for commands.")
-	}
-
-	log.Println("All systems operational")
+	// ── Wait for shutdown ───────────────────────────────────────────────
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -643,32 +161,471 @@ func (app *App) Run() error {
 	return app.Shutdown()
 }
 
+// Shutdown gracefully stops all components.
 func (app *App) Shutdown() error {
-	for _, chatID := range app.config.ChatIDs {
+	for _, chatID := range app.cfg.ChatIDs {
 		app.sendToChat(chatID, "🔴 *Pogodnik Shutting Down*")
 	}
 
 	app.bot.Stop()
-	close(app.stopChan)
+	log.Println("✓ Bot stopped")
 
-	done := make(chan struct{})
-	go func() {
-		app.wg.Wait()
-		close(done)
-	}()
+	app.engine.Stop()
+	log.Println("✓ Engine stopped")
 
-	select {
-	case <-done:
-		log.Println("Shutdown complete")
-	case <-time.After(10 * time.Second):
-		log.Println("Shutdown timeout")
+	sqlDB, err := app.db.DB()
+	if err == nil {
+		_ = sqlDB.Close()
+		log.Println("✓ Database closed")
 	}
 
 	return nil
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Command handlers
+// ═══════════════════════════════════════════════════════════════════════════
+
+func (app *App) registerHandlers() {
+	app.bot.Handle("/start", app.handleStart)
+	app.bot.Handle("/help", app.handleStart)
+	app.bot.Handle("/add", app.handleAdd)
+	app.bot.Handle("/list", app.handleList)
+	app.bot.Handle("/mute", app.handleMute)
+	app.bot.Handle("/unmute", app.handleUnmute)
+	app.bot.Handle("/check", app.handleCheck)
+	app.bot.Handle("/export", app.handleExport)
+	app.bot.Handle("/status", app.handleStatus)
+}
+
+// ── /start & /help ──────────────────────────────────────────────────────
+
+func (app *App) handleStart(c tele.Context) error {
+	text := `🌤 *Pogodnik v2\.0 — Aviation Weather Monitor*
+
+Track real\-time weather at airports worldwide\.
+
+*Commands:*
+• /add ICAO — Add airport \(e\.g\. /add EGLL\)
+• /list — Show monitored airports
+• /check ICAO — Force weather check
+• /mute ICAO — Mute notifications
+• /unmute ICAO — Unmute notifications
+• /export — Download Excel report
+• /status — Bot status
+• /help — This message`
+
+	return c.Send(text, &tele.SendOptions{ParseMode: tele.ModeMarkdownV2})
+}
+
+// ── /add [ICAO] ─────────────────────────────────────────────────────────
+
+func (app *App) handleAdd(c tele.Context) error {
+	args := strings.Fields(c.Message().Payload)
+	if len(args) == 0 {
+		return c.Send("Usage: /add ICAO\nExample: /add EGLL")
+	}
+
+	icao := strings.ToUpper(strings.TrimSpace(args[0]))
+	if len(icao) != 4 {
+		return c.Send("❌ ICAO code must be exactly 4 characters.")
+	}
+
+	// Check if already exists.
+	existing, err := storage.GetAirport(app.db, icao)
+	if err == nil && existing != nil {
+		return c.Send(fmt.Sprintf("ℹ️ Airport %s (%s) is already monitored.", existing.ICAO, existing.City))
+	}
+
+	_ = c.Send(fmt.Sprintf("🔍 Looking up %s...", icao))
+
+	// Lookup via API or fallback.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	apt, err := services.LookupAirport(ctx, icao, app.cfg.AVWXToken)
+	if err != nil {
+		return c.Send(fmt.Sprintf("❌ Could not find airport %s:\n%v", icao, err))
+	}
+
+	// Save to database.
+	if err := app.db.Create(apt).Error; err != nil {
+		return c.Send(fmt.Sprintf("❌ Failed to save airport %s:\n%v", icao, err))
+	}
+
+	msg := fmt.Sprintf("✅ Added *%s* \\(%s\\)\n📍 %.4f, %.4f\n🕐 %s",
+		escapeV2(apt.City),
+		apt.ICAO,
+		apt.Lat,
+		apt.Lon,
+		escapeV2(apt.Timezone),
+	)
+	return c.Send(msg, &tele.SendOptions{ParseMode: tele.ModeMarkdownV2})
+}
+
+// ── /list ───────────────────────────────────────────────────────────────
+
+func (app *App) handleList(c tele.Context) error {
+	airports, err := storage.ListAirports(app.db)
+	if err != nil {
+		return c.Send(fmt.Sprintf("❌ Database error: %v", err))
+	}
+
+	if len(airports) == 0 {
+		return c.Send("No airports monitored yet. Use /add ICAO to add one.")
+	}
+
+	var b strings.Builder
+	b.WriteString("🗺 *Monitored Airports*\n\n")
+
+	for i, apt := range airports {
+		status := "🟢"
+		mutedTag := ""
+		if apt.IsMuted {
+			status = "🔇"
+			mutedTag = " \\[MUTED\\]"
+		}
+
+		b.WriteString(fmt.Sprintf(
+			"%s `%s` — %s%s\n",
+			status,
+			apt.ICAO,
+			escapeV2(apt.City),
+			mutedTag,
+		))
+
+		// Blank line every 5 airports for readability.
+		if (i+1)%5 == 0 && i < len(airports)-1 {
+			b.WriteByte('\n')
+		}
+	}
+
+	b.WriteString(fmt.Sprintf("\n_Total: %d airports_", len(airports)))
+
+	return c.Send(b.String(), &tele.SendOptions{ParseMode: tele.ModeMarkdownV2})
+}
+
+// ── /mute [ICAO] ───────────────────────────────────────────────────────
+
+func (app *App) handleMute(c tele.Context) error {
+	icao, err := extractICAO(c)
+	if err != nil {
+		return c.Send(err.Error())
+	}
+
+	if err := storage.SetMuted(app.db, icao, true); err != nil {
+		return c.Send(fmt.Sprintf("❌ %v", err))
+	}
+
+	return c.Send(fmt.Sprintf("🔇 Airport %s is now *muted*. It will still be logged but no notifications will be sent.", icao),
+		&tele.SendOptions{ParseMode: tele.ModeMarkdown})
+}
+
+// ── /unmute [ICAO] ──────────────────────────────────────────────────────
+
+func (app *App) handleUnmute(c tele.Context) error {
+	icao, err := extractICAO(c)
+	if err != nil {
+		return c.Send(err.Error())
+	}
+
+	if err := storage.SetMuted(app.db, icao, false); err != nil {
+		return c.Send(fmt.Sprintf("❌ %v", err))
+	}
+
+	return c.Send(fmt.Sprintf("🔔 Airport %s is now *unmuted*. Notifications will resume.", icao),
+		&tele.SendOptions{ParseMode: tele.ModeMarkdown})
+}
+
+// ── /check [ICAO] ───────────────────────────────────────────────────────
+
+func (app *App) handleCheck(c tele.Context) error {
+	icao, err := extractICAO(c)
+	if err != nil {
+		return c.Send(err.Error())
+	}
+
+	apt, err := storage.GetAirport(app.db, icao)
+	if err != nil {
+		return c.Send(fmt.Sprintf("❌ Airport %s not found in database. Use /add %s first.", icao, icao))
+	}
+
+	_ = c.Send(fmt.Sprintf("📡 Fetching weather for %s (%s)...", apt.ICAO, apt.City))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Convert to monitor.Airport for fetch functions.
+	monApt := monitor.Airport{
+		ICAO:      apt.ICAO,
+		City:      apt.City,
+		Latitude:  apt.Lat,
+		Longitude: apt.Lon,
+		Timezone:  apt.Timezone,
+	}
+
+	// Fetch METAR.
+	obs, err := monitor.FetchMETAR(ctx, apt.ICAO)
+	if err != nil {
+		return c.Send(fmt.Sprintf("❌ METAR fetch failed for %s:\n%v", icao, err))
+	}
+
+	// Fetch forecast (best-effort).
+	fc, _ := monitor.FetchForecast(ctx, monApt)
+
+	// Calculate delta and condition.
+	var forecastTemp, delta float64
+	var condition string
+	if fc != nil {
+		forecastTemp = fc.TempCelsius
+		delta = obs.TempCelsius - fc.TempCelsius
+		condition = classifyDelta(delta)
+	} else {
+		condition = "NoForecast"
+	}
+
+	// Save to DB (always).
+	wlog := &storage.WeatherLog{
+		AirportICAO:  apt.ICAO,
+		Timestamp:    time.Now().UTC(),
+		ForecastTemp: forecastTemp,
+		RealTemp:     obs.TempCelsius,
+		Delta:        delta,
+		Condition:    condition,
+	}
+	_ = storage.InsertWeatherLog(app.db, wlog)
+
+	// Build report message.
+	msg := formatCheckReport(obs, fc, monApt, delta, condition)
+	return c.Send(msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+}
+
+// ── /export ─────────────────────────────────────────────────────────────
+
+func (app *App) handleExport(c tele.Context) error {
+	_ = c.Send("📊 Generating Excel report...")
+
+	var logs []storage.WeatherLog
+	err := app.db.
+		Order("timestamp DESC").
+		Limit(5000).
+		Find(&logs).Error
+	if err != nil {
+		return c.Send(fmt.Sprintf("❌ Database error: %v", err))
+	}
+
+	if len(logs) == 0 {
+		return c.Send("ℹ️ No weather logs found. Wait for the first monitoring cycle.")
+	}
+
+	f, err := services.GenerateReport(logs)
+	if err != nil {
+		return c.Send(fmt.Sprintf("❌ Report generation failed: %v", err))
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	buf, err := f.WriteToBuffer()
+	if err != nil {
+		return c.Send(fmt.Sprintf("❌ Failed to write Excel buffer: %v", err))
+	}
+
+	filename := fmt.Sprintf("pogodnik_%s.xlsx", time.Now().UTC().Format("2006-01-02_1504"))
+
+	doc := &tele.Document{
+		File:     tele.FromReader(buf),
+		FileName: filename,
+		Caption:  fmt.Sprintf("📊 Weather report — %d records", len(logs)),
+	}
+
+	return c.Send(doc)
+}
+
+// ── /status ─────────────────────────────────────────────────────────────
+
+func (app *App) handleStatus(c tele.Context) error {
+	airports, _ := storage.ListAirports(app.db)
+
+	var totalLogs int64
+	app.db.Model(&storage.WeatherLog{}).Count(&totalLogs)
+
+	var todayLogs int64
+	todayStart := time.Now().UTC().Truncate(24 * time.Hour)
+	app.db.Model(&storage.WeatherLog{}).
+		Where("timestamp >= ?", todayStart).
+		Count(&todayLogs)
+
+	muted := 0
+	for _, a := range airports {
+		if a.IsMuted {
+			muted++
+		}
+	}
+
+	var dbSize string
+	if info, err := os.Stat(app.cfg.DBPath); err == nil {
+		mb := float64(info.Size()) / 1024 / 1024
+		dbSize = fmt.Sprintf("%.2f MB", mb)
+	} else {
+		dbSize = "unknown"
+	}
+
+	status := fmt.Sprintf(`📊 *Pogodnik Status*
+
+• Airports: %d (%d muted)
+• Total logs: %d
+• Today's logs: %d
+• DB size: %s
+• Poll interval: %s
+• Uptime: running`,
+		len(airports), muted,
+		totalLogs,
+		todayLogs,
+		dbSize,
+		app.cfg.PollInterval,
+	)
+
+	return c.Send(status, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+// extractICAO pulls and validates the ICAO argument from a command.
+func extractICAO(c tele.Context) (string, error) {
+	args := strings.Fields(c.Message().Payload)
+	if len(args) == 0 {
+		return "", fmt.Errorf("Usage: %s ICAO\nExample: %s KORD", c.Message().Text, c.Message().Text)
+	}
+
+	icao := strings.ToUpper(strings.TrimSpace(args[0]))
+	if len(icao) != 4 {
+		return "", fmt.Errorf("❌ ICAO code must be exactly 4 characters.")
+	}
+
+	return icao, nil
+}
+
+// classifyDelta maps a Celsius delta to an accuracy label.
+func classifyDelta(delta float64) string {
+	abs := math.Abs(delta)
+	switch {
+	case abs < 1.0:
+		return "Accurate"
+	case abs < 2.5:
+		return "Close"
+	case abs < 5.0:
+		return "Off"
+	default:
+		return "Poor"
+	}
+}
+
+// formatCheckReport builds a one-off weather report for /check.
+func formatCheckReport(obs *monitor.Observation, fc *monitor.HourlyForecast, apt monitor.Airport, delta float64, condition string) string {
+	var b strings.Builder
+	b.Grow(800)
+
+	loc, err := time.LoadLocation(apt.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	localNow := time.Now().In(loc)
+
+	b.WriteString(fmt.Sprintf("🛫 *%s (%s)*\n", apt.City, apt.ICAO))
+	b.WriteString(fmt.Sprintf("🕐 %s\n\n", localNow.Format("Mon, 02 Jan 2006 15:04 MST")))
+
+	// Temperature
+	tempF := monitor.CelsiusToFahrenheit(obs.TempCelsius)
+	b.WriteString("📡 *Current Conditions*\n")
+	b.WriteString("```\n")
+	b.WriteString(fmt.Sprintf("Temperature : %s%.1f°C / %s%.1f°F\n",
+		tempSign(obs.TempCelsius), obs.TempCelsius,
+		tempSign(tempF), tempF))
+
+	// Wind
+	wind := "Calm"
+	if obs.WindSpeed > 0 || obs.WindGust > 0 {
+		dir := "VRB"
+		if obs.WindDir >= 0 {
+			dir = fmt.Sprintf("%03d°", obs.WindDir)
+		}
+		wind = fmt.Sprintf("%s @ %dkt", dir, obs.WindSpeed)
+		if obs.WindGust > 0 {
+			wind += fmt.Sprintf(", gusting %dkt", obs.WindGust)
+		}
+	}
+	b.WriteString(fmt.Sprintf("Wind        : %s\n", wind))
+	b.WriteString(fmt.Sprintf("Visibility  : %s\n", obs.Visibility))
+	b.WriteString("```\n\n")
+
+	// Forecast comparison
+	b.WriteString("🎯 *Forecast vs Reality*\n")
+	if fc != nil {
+		fcF := monitor.CelsiusToFahrenheit(fc.TempCelsius)
+		deltaF := delta * 9.0 / 5.0
+		b.WriteString("```\n")
+		b.WriteString(fmt.Sprintf("Forecast    : %s%.1f°C / %s%.1f°F\n",
+			tempSign(fc.TempCelsius), fc.TempCelsius,
+			tempSign(fcF), fcF))
+		b.WriteString(fmt.Sprintf("Reality     : %s%.1f°C / %s%.1f°F\n",
+			tempSign(obs.TempCelsius), obs.TempCelsius,
+			tempSign(tempF), tempF))
+		b.WriteString(fmt.Sprintf("Delta       : %s%.1f°C / %s%.1f°F\n",
+			tempSign(delta), delta,
+			tempSign(deltaF), deltaF))
+		b.WriteString(fmt.Sprintf("Verdict     : %s\n", condition))
+		b.WriteString("```\n")
+	} else {
+		b.WriteString("_Forecast not available_\n")
+	}
+
+	b.WriteString(fmt.Sprintf("\n📋 `%s`", obs.Raw))
+
+	return b.String()
+}
+
+// tempSign returns "+" for non-negative, "" for negative (fmt adds "-").
+func tempSign(v float64) string {
+	if v < 0 {
+		return ""
+	}
+	return "+"
+}
+
+// escapeV2 escapes special characters for Telegram MarkdownV2.
+func escapeV2(s string) string {
+	special := []string{"_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"}
+	for _, ch := range special {
+		s = strings.ReplaceAll(s, ch, "\\"+ch)
+	}
+	return s
+}
+
+// sendToChat delivers a message to a chat ID.
+func (app *App) sendToChat(chatID int64, msg string) {
+	chat := &tele.Chat{ID: chatID}
+	_, err := app.bot.Send(chat, msg, &tele.SendOptions{
+		ParseMode:             tele.ModeMarkdownV2,
+		DisableWebPagePreview: true,
+	})
+	if err != nil {
+		log.Printf("send to %d: %v", chatID, err)
+	}
+}
+
+// Ensure excelize import is used (compile guard).
+var _ *excelize.File
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Entry point
+// ═══════════════════════════════════════════════════════════════════════════
+
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	log.Println("Pogodnik v2.0 starting...")
 
 	cfg, err := LoadConfig()
 	if err != nil {
