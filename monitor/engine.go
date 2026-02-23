@@ -15,13 +15,9 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Configuration
-// ═══════════════════════════════════════════════════════════════════════════
-
 const (
 	ForecastCacheTTL = 3 * time.Hour
-	RetentionPeriod  = 30 * 24 * time.Hour // 30 days
+	RetentionPeriod  = 30 * 24 * time.Hour
 )
 
 type EngineConfig struct {
@@ -39,10 +35,6 @@ func DefaultEngineConfig() EngineConfig {
 		PurgeAge:     RetentionPeriod,
 	}
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Engine
-// ═══════════════════════════════════════════════════════════════════════════
 
 type Engine struct {
 	db       *gorm.DB
@@ -144,11 +136,7 @@ func (e *Engine) tick() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Per-airport processing — EVENT-DRIVEN LOGGING
-//
-// The DB log is written ONLY when the METAR text changes (i.e., when
-// a notification would be triggered). This gives us one record per
-// actual weather observation rather than one per poll cycle.
+// Per-airport processing — event-driven logging
 // ═══════════════════════════════════════════════════════════════════════════
 
 func (e *Engine) processAirport(apt storage.Airport) {
@@ -157,19 +145,14 @@ func (e *Engine) processAirport(apt storage.Airport) {
 
 	monitorApt := storageToMonitorAirport(apt)
 
-	// ── Step A (ALWAYS): Fetch METAR / SPECI ────────────────────────────
-
 	obs, err := FetchMETAR(ctx, apt.ICAO)
 	if err != nil {
 		log.Printf("[engine][%s] METAR: %v", apt.ICAO, err)
 		return
 	}
 
-	// ── Early exit: has the raw METAR actually changed? ─────────────────
-
 	metarChanged := e.hasRawChanged(apt.ICAO, obs.Raw)
 	if !metarChanged {
-		// Nothing new — update in-memory state quietly and return.
 		e.ensureState(apt.ICAO, monitorApt)
 		_ = e.states[apt.ICAO].Update(obs.TempCelsius, monitorApt)
 		if hpa, ok := ParsePressure(obs.Raw); ok {
@@ -178,27 +161,20 @@ func (e *Engine) processAirport(apt storage.Airport) {
 		return
 	}
 
-	// METAR changed — proceed with full processing.
 	e.setLastRaw(apt.ICAO, obs.Raw)
 
-	// ── Step B (CONDITIONAL): Smart Forecast Fetch ──────────────────────
-
 	ff, forecastSource := e.getOrFetchForecast(ctx, apt.ICAO, monitorApt)
-
-	// ── Step C: Calculate delta (Forecast − Reality) ────────────────────
 
 	var forecastTemp, delta float64
 	var condition string
 
 	if ff != nil && ff.CurrentHour != nil {
 		forecastTemp = ff.CurrentHour.TempCelsius
-		delta = forecastTemp - obs.TempCelsius // positive = warm bias
+		delta = forecastTemp - obs.TempCelsius
 		condition = classifyDelta(delta)
 	} else {
 		condition = "NoForecast"
 	}
-
-	// ── Step D: Derive contextual flags from METAR ──────────────────────
 
 	windSpeedMS := KnotsToMS(obs.WindSpeed)
 	isRaining := hasRainOrShowers(obs.PresentWeather)
@@ -209,16 +185,12 @@ func (e *Engine) processAirport(apt storage.Airport) {
 		directRadiation = ff.CurrentExtended.DirectRadiation
 	}
 
-	// ── Step E: Sensor bias check ───────────────────────────────────────
-
 	var sensorWarnings []SensorWarning
 	var currentExt *HourlyExtended
 	if ff != nil {
 		currentExt = ff.CurrentExtended
 	}
 	sensorWarnings = CheckSensorBias(obs, currentExt)
-
-	// ── Step F: Update in-memory state ──────────────────────────────────
 
 	e.ensureState(apt.ICAO, monitorApt)
 
@@ -227,8 +199,6 @@ func (e *Engine) processAirport(apt storage.Airport) {
 	}
 
 	_ = e.states[apt.ICAO].Update(obs.TempCelsius, monitorApt)
-
-	// ── Step G (EVENT-DRIVEN): Save to DB only on change ────────────────
 
 	wlog := &storage.WeatherLog{
 		AirportICAO:     apt.ICAO,
@@ -249,14 +219,7 @@ func (e *Engine) processAirport(apt storage.Airport) {
 		log.Printf("[engine][%s] DB insert: %v", apt.ICAO, err)
 	}
 
-	// ── Step H (CONDITIONAL): Telegram notification ─────────────────────
-
 	if apt.IsMuted {
-		label := "METAR"
-		if obs.IsSpeci {
-			label = "⚡SPECI"
-		}
-		log.Printf("[engine][%s] %s logged (muted, no notify)", apt.ICAO, label)
 		return
 	}
 
@@ -272,7 +235,7 @@ func (e *Engine) processAirport(apt storage.Airport) {
 	if obs.IsSpeci {
 		label = "⚡SPECI"
 	}
-	log.Printf("[engine][%s] %s logged+notified (%.1f°C, Δ%+.1f°C, %s, src:%s, warn:%d)",
+	log.Printf("[engine][%s] %s logged+sent (%.1f°C, Δ%+.1f°C, %s, src:%s, warn:%d)",
 		apt.ICAO, label, obs.TempCelsius, delta, condition,
 		forecastSource, len(sensorWarnings))
 }
@@ -318,7 +281,7 @@ func (e *Engine) getOrFetchForecast(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Full message builder
+// Full message builder (with Tomorrow section)
 // ═══════════════════════════════════════════════════════════════════════════
 
 func buildFullMessage(
@@ -331,7 +294,7 @@ func buildFullMessage(
 	forecastSource string,
 ) string {
 	var b strings.Builder
-	b.Grow(2000)
+	b.Grow(2200)
 
 	loc, _ := time.LoadLocation(apt.Timezone)
 	if loc == nil {
@@ -441,6 +404,43 @@ func buildFullMessage(
 		b.WriteString("_Outlook not available_\n")
 	}
 
+	// ── TOMORROW ────────────────────────────────────────────────────────
+
+	if ff != nil && ff.HasTomorrowExtremes {
+		tomorrow := localNow.AddDate(0, 0, 1)
+		b.WriteString("\n🌅 *TOMORROW* (")
+		b.WriteString(tomorrow.Format("Mon, 02 Jan"))
+		b.WriteString(")\n```\n")
+		fmt.Fprintf(&b, "Max : %s\n", FormatTemp(ff.TomorrowMax))
+		fmt.Fprintf(&b, "Min : %s\n", FormatTemp(ff.TomorrowMin))
+
+		// Comparison with today.
+		if ff.HasDailyExtremes {
+			diffMax := ff.TomorrowMax - ff.DailyMax
+			diffMin := ff.TomorrowMin - ff.DailyMin
+
+			maxArrow := "→"
+			if diffMax > 0.5 {
+				maxArrow = "↑ warmer"
+			} else if diffMax < -0.5 {
+				maxArrow = "↓ cooler"
+			}
+
+			minArrow := "→"
+			if diffMin > 0.5 {
+				minArrow = "↑ warmer"
+			} else if diffMin < -0.5 {
+				minArrow = "↓ cooler"
+			}
+
+			fmt.Fprintf(&b, "\nvs Today:\n")
+			fmt.Fprintf(&b, "  High %+.1f°C (%s)\n", diffMax, maxArrow)
+			fmt.Fprintf(&b, "  Low  %+.1f°C (%s)\n", diffMin, minArrow)
+		}
+
+		b.WriteString("```\n")
+	}
+
 	// ── SENSOR QA ───────────────────────────────────────────────────────
 
 	if len(sensorWarnings) > 0 {
@@ -504,7 +504,6 @@ func narrative(delta float64) string {
 	}
 }
 
-// hasFogOrMist checks for FG or BR in present weather.
 func hasFogOrMist(wx []string) bool {
 	for _, w := range wx {
 		u := strings.ToUpper(w)
@@ -566,7 +565,7 @@ func (e *Engine) sendToChat(chatID int64, msg string) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Purge loop — daily cleanup, 30-day retention
+// Purge loop — 30-day retention
 // ═══════════════════════════════════════════════════════════════════════════
 
 func (e *Engine) purgeLoop() {
@@ -598,6 +597,6 @@ func (e *Engine) purge() {
 	if fcErr != nil {
 		log.Printf("[engine] purge cache: %v", fcErr)
 	} else if fc > 0 {
-		log.Printf("[engine] purged %d stale forecast cache entries", fc)
+		log.Printf("[engine] purged %d stale cache entries", fc)
 	}
 }

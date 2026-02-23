@@ -3,7 +3,6 @@ package services
 import (
 	"fmt"
 	"math"
-	"time"
 
 	"pogodnik/storage"
 
@@ -17,32 +16,23 @@ import (
 func GenerateReport(logs []storage.WeatherLog) (*excelize.File, error) {
 	f := excelize.NewFile()
 
-	// ── Styles ──────────────────────────────────────────────────────────
-
 	styles, err := createStyles(f)
 	if err != nil {
 		return nil, err
 	}
 
-	// ── Sheet 1: Raw Data ───────────────────────────────────────────────
-
 	if err := writeRawDataSheet(f, styles, logs); err != nil {
 		return nil, fmt.Errorf("excel: raw data: %w", err)
 	}
-
-	// ── Sheet 2: Bias Analysis ──────────────────────────────────────────
 
 	if err := writeBiasSheet(f, styles, logs); err != nil {
 		return nil, fmt.Errorf("excel: bias: %w", err)
 	}
 
-	// ── Sheet 3: Daily Summary ──────────────────────────────────────────
-
 	if err := writeDailySheet(f, styles, logs); err != nil {
 		return nil, fmt.Errorf("excel: daily: %w", err)
 	}
 
-	// Remove default Sheet1.
 	f.DeleteSheet("Sheet1")
 	f.SetActiveSheet(0)
 
@@ -89,7 +79,7 @@ func createStyles(f *excelize.File) (*reportStyles, error) {
 	}
 
 	s.pct, err = f.NewStyle(&excelize.Style{
-		NumFmt:    10, // 0.00%
+		NumFmt:    10,
 		Alignment: &excelize.Alignment{Horizontal: "center"},
 	})
 	if err != nil {
@@ -131,7 +121,7 @@ func createStyles(f *excelize.File) (*reportStyles, error) {
 	}
 
 	s.dateCell, err = f.NewStyle(&excelize.Style{
-		NumFmt:    22, // date+time
+		NumFmt:    22,
 		Alignment: &excelize.Alignment{Horizontal: "center"},
 	})
 	if err != nil {
@@ -139,7 +129,7 @@ func createStyles(f *excelize.File) (*reportStyles, error) {
 	}
 
 	s.boolTrue, err = f.NewStyle(&excelize.Style{
-		Font: &excelize.Font{Color: "#0000FF"},
+		Font:      &excelize.Font{Color: "#0000FF"},
 		Alignment: &excelize.Alignment{Horizontal: "center"},
 	})
 	if err != nil {
@@ -147,7 +137,7 @@ func createStyles(f *excelize.File) (*reportStyles, error) {
 	}
 
 	s.boolFalse, err = f.NewStyle(&excelize.Style{
-		Font: &excelize.Font{Color: "#808080"},
+		Font:      &excelize.Font{Color: "#808080"},
 		Alignment: &excelize.Alignment{Horizontal: "center"},
 	})
 	if err != nil {
@@ -178,18 +168,16 @@ func writeRawDataSheet(f *excelize.File, s *reportStyles, logs []storage.Weather
 
 	widths := []float64{12, 10, 8, 14, 14, 12, 10, 12, 12, 14, 6, 6, 6}
 
-	// Write headers.
 	for i, h := range headers {
-		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
-		_ = f.SetCellValue(sheet, cell, h)
-		_ = f.SetCellStyle(sheet, cell, cell, s.header)
+		c, _ := excelize.CoordinatesToCellName(i+1, 1)
+		_ = f.SetCellValue(sheet, c, h)
+		_ = f.SetCellStyle(sheet, c, c, s.header)
 	}
 	for i, w := range widths {
 		col, _ := excelize.ColumnNumberToName(i + 1)
 		_ = f.SetColWidth(sheet, col, col, w)
 	}
 
-	// Write data.
 	for rowIdx, l := range logs {
 		row := rowIdx + 2
 
@@ -197,50 +185,46 @@ func writeRawDataSheet(f *excelize.File, s *reportStyles, logs []storage.Weather
 		verdict := classifyAbsDelta(ad)
 
 		vals := []interface{}{
-			l.Timestamp.UTC().Format("2006-01-02"),         // A: Date
-			l.Timestamp.UTC().Format("15:04:05"),           // B: Time
-			l.AirportICAO,                                  // C: Airport
-			l.ForecastTemp,                                 // D: Forecast
-			l.RealTemp,                                     // E: Reality
-			l.Delta,                                        // F: Delta
-			ad,                                             // G: |Delta|
-			verdict,                                        // H: Verdict
-			l.WindSpeed,                                    // I: Wind
-			l.DirectRadiation,                              // J: Solar
-			boolStr(l.IsRaining),                           // K: Rain
-			boolStr(l.IsFoggy),                             // L: Fog
-			boolStr(l.IsSpeci),                             // M: SPECI
+			l.Timestamp.UTC().Format("2006-01-02"),
+			l.Timestamp.UTC().Format("15:04:05"),
+			l.AirportICAO,
+			l.ForecastTemp,
+			l.RealTemp,
+			l.Delta,
+			ad,
+			verdict,
+			l.WindSpeed,
+			l.DirectRadiation,
+			boolStr(l.IsRaining),
+			boolStr(l.IsFoggy),
+			boolStr(l.IsSpeci),
 		}
 
 		for col, v := range vals {
-			cell, _ := excelize.CoordinatesToCellName(col+1, row)
-			_ = f.SetCellValue(sheet, cell, v)
+			c, _ := excelize.CoordinatesToCellName(col+1, row)
+			_ = f.SetCellValue(sheet, c, v)
 
-			// Style numeric columns.
 			if col >= 3 && col <= 6 || col == 8 || col == 9 {
-				_ = f.SetCellStyle(sheet, cell, cell, s.number)
+				_ = f.SetCellStyle(sheet, c, c, s.number)
 			}
 
-			// Bool columns.
 			if col >= 10 && col <= 12 {
 				if v == "YES" {
-					_ = f.SetCellStyle(sheet, cell, cell, s.boolTrue)
+					_ = f.SetCellStyle(sheet, c, c, s.boolTrue)
 				} else {
-					_ = f.SetCellStyle(sheet, cell, cell, s.boolFalse)
+					_ = f.SetCellStyle(sheet, c, c, s.boolFalse)
 				}
 			}
 		}
 
-		// Highlight entire row if |Delta| > 1.0°C.
 		if ad > 1.0 {
 			for col := 0; col < len(vals); col++ {
-				cell, _ := excelize.CoordinatesToCellName(col+1, row)
-				_ = f.SetCellStyle(sheet, cell, cell, s.red)
+				c, _ := excelize.CoordinatesToCellName(col+1, row)
+				_ = f.SetCellStyle(sheet, c, c, s.red)
 			}
 		}
 	}
 
-	// Freeze header.
 	_ = f.SetPanes(sheet, &excelize.Panes{
 		Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft",
 	})
@@ -259,7 +243,6 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 		return err
 	}
 
-	// Group logs by airport.
 	byAirport := make(map[string][]storage.WeatherLog)
 	var icaoOrder []string
 
@@ -270,7 +253,6 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 		byAirport[l.AirportICAO] = append(byAirport[l.AirportICAO], l)
 	}
 
-	// Headers.
 	headers := []string{
 		"Airport",
 		"Observations",
@@ -289,16 +271,15 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 	widths := []float64{10, 14, 14, 14, 14, 14, 14, 14, 10, 14, 10, 16}
 
 	for i, h := range headers {
-		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
-		_ = f.SetCellValue(sheet, cell, h)
-		_ = f.SetCellStyle(sheet, cell, cell, s.header)
+		c, _ := excelize.CoordinatesToCellName(i+1, 1)
+		_ = f.SetCellValue(sheet, c, h)
+		_ = f.SetCellStyle(sheet, c, c, s.header)
 	}
 	for i, w := range widths {
 		col, _ := excelize.ColumnNumberToName(i + 1)
 		_ = f.SetColWidth(sheet, col, col, w)
 	}
 
-	// Data rows.
 	row := 2
 	for _, icao := range icaoOrder {
 		stats := storage.ComputeBiasStats(icao, byAirport[icao])
@@ -320,18 +301,17 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 		}
 
 		for col, v := range vals {
-			cell, _ := excelize.CoordinatesToCellName(col+1, row)
-			_ = f.SetCellValue(sheet, cell, v)
+			c, _ := excelize.CoordinatesToCellName(col+1, row)
+			_ = f.SetCellValue(sheet, c, v)
 
 			switch col {
 			case 2, 7, 9:
-				_ = f.SetCellStyle(sheet, cell, cell, s.number)
+				_ = f.SetCellStyle(sheet, c, c, s.number)
 			case 3, 4, 5, 6:
-				_ = f.SetCellStyle(sheet, cell, cell, s.pct)
+				_ = f.SetCellStyle(sheet, c, c, s.pct)
 			}
 		}
 
-		// Colour the assessment cell.
 		assessCell, _ := excelize.CoordinatesToCellName(12, row)
 		switch assessment {
 		case "EXCELLENT":
@@ -342,7 +322,6 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 			_ = f.SetCellStyle(sheet, assessCell, assessCell, s.red)
 		}
 
-		// Colour bias direction.
 		biasCell, _ := excelize.CoordinatesToCellName(3, row)
 		if math.Abs(stats.AvgBias) > 1.0 {
 			_ = f.SetCellStyle(sheet, biasCell, biasCell, s.red)
@@ -354,8 +333,6 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 
 		row++
 	}
-
-	// ── Legend ───────────────────────────────────────────────────────────
 
 	legendRow := row + 2
 	legends := []struct{ label, desc string }{
@@ -440,7 +417,6 @@ func writeDailySheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLo
 			}
 		}
 
-		// Colour quality cell.
 		qCell, _ := excelize.CoordinatesToCellName(6, row)
 		switch quality {
 		case "EXCELLENT":
@@ -451,7 +427,6 @@ func writeDailySheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLo
 			_ = f.SetCellStyle(sheet, qCell, qCell, s.red)
 		}
 
-		// Highlight bad days.
 		if ds.AvgAbsError > 1.0 {
 			for col := 0; col < len(vals); col++ {
 				c, _ := excelize.CoordinatesToCellName(col+1, row)
@@ -459,8 +434,6 @@ func writeDailySheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLo
 			}
 		}
 	}
-
-	// ── 30-day aggregate at the bottom ──────────────────────────────────
 
 	if len(summaries) > 0 {
 		aggRow := len(summaries) + 3
@@ -548,8 +521,4 @@ func dailyQuality(avgAbsErr float64) string {
 	default:
 		return "POOR"
 	}
-}
-
-func celsiusToF(c float64) float64 {
-	return c*9.0/5.0 + 32.0
 }
