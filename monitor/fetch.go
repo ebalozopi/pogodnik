@@ -24,11 +24,15 @@ type Observation struct {
 	TempCelsius float64
 	DewPointC   float64
 	WindDir     int
-	WindSpeed   int
+	WindSpeed   int // knots
 	WindGust    int
 	Visibility  string
 	VisMeters   float64
-	IsSpeci     bool // true when the report is a SPECI (special observation)
+	IsSpeci     bool
+
+	// Weather phenomena tokens extracted from the METAR body
+	// (e.g., "RA", "TSRA", "SN", "+SHRA", "-DZ").
+	PresentWeather []string
 }
 
 // HourlyForecast is a single data-point from Open-Meteo.
@@ -37,14 +41,24 @@ type HourlyForecast struct {
 	TempCelsius float64
 }
 
+// HourlyExtended adds radiation and humidity to the hourly point.
+type HourlyExtended struct {
+	Time              time.Time
+	TempCelsius       float64
+	DirectRadiation   float64 // W/m²
+	RelativeHumidity  float64 // %
+}
+
 // FullForecast holds everything we extract from Open-Meteo for one airport.
 type FullForecast struct {
 	CurrentHour      *HourlyForecast
+	CurrentExtended  *HourlyExtended // includes radiation + humidity
 	Upcoming         []HourlyForecast
+	UpcomingExtended []HourlyExtended
 	DailyMax         float64
 	DailyMin         float64
 	HasDailyExtremes bool
-	FromCache        bool // true when served from DB cache
+	FromCache        bool
 }
 
 // WeatherSnapshot is a read-only copy of WeatherState.
@@ -62,6 +76,11 @@ type WeatherSnapshot struct {
 
 func CelsiusToFahrenheit(c float64) float64 {
 	return c*9.0/5.0 + 32.0
+}
+
+// KnotsToMS converts knots to metres per second.
+func KnotsToMS(kt int) float64 {
+	return float64(kt) * 0.514444
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -84,7 +103,6 @@ var httpClient = &http.Client{
 const noaaMetarEndpoint = "https://aviationweather.gov/api/data/metar"
 
 // FetchMETAR retrieves the current METAR or SPECI for an ICAO station.
-// SPECI (special weather observation) is automatically detected.
 func FetchMETAR(ctx context.Context, icao string) (*Observation, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, noaaMetarEndpoint, nil)
 	if err != nil {
@@ -94,7 +112,7 @@ func FetchMETAR(ctx context.Context, icao string) (*Observation, error) {
 	q := req.URL.Query()
 	q.Set("ids", strings.ToUpper(icao))
 	q.Set("format", "raw")
-	q.Set("hours", "1") // include recent SPECI within last hour
+	q.Set("hours", "1")
 	req.URL.RawQuery = q.Encode()
 
 	resp, err := httpClient.Do(req)
@@ -117,9 +135,6 @@ func FetchMETAR(ctx context.Context, icao string) (*Observation, error) {
 		return nil, fmt.Errorf("metar %s: empty response", icao)
 	}
 
-	// NOAA may return multiple observations (METAR + SPECI).
-	// Pick the most recent one (first line).
-	// If multiple lines, check if any is SPECI and prefer it.
 	lines := strings.Split(raw, "\n")
 	bestLine := ""
 	isSpeci := false
@@ -129,14 +144,11 @@ func FetchMETAR(ctx context.Context, icao string) (*Observation, error) {
 		if line == "" {
 			continue
 		}
-
 		if strings.HasPrefix(line, "SPECI") || strings.Contains(line, " SPECI ") {
-			// SPECI takes priority — it's the most urgent/recent.
 			bestLine = line
 			isSpeci = true
 			break
 		}
-
 		if bestLine == "" {
 			bestLine = line
 		}
@@ -150,7 +162,6 @@ func FetchMETAR(ctx context.Context, icao string) (*Observation, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	obs.IsSpeci = isSpeci
 	return obs, nil
 }
@@ -163,12 +174,17 @@ var (
 	reWind       = regexp.MustCompile(`\b(VRB|\d{3})(\d{2,3})(G(\d{2,3}))?KT\b`)
 	reTemp       = regexp.MustCompile(`\b(M?\d{2})/(M?\d{2})\b`)
 	reWindVarDir = regexp.MustCompile(`^\d{3}V\d{3}$`)
+
+	// Weather phenomena: optional intensity (+/-), optional descriptor
+	// (TS, SH, FZ, etc.), and one or more phenomena (RA, SN, DZ, etc.).
+	reWeather = regexp.MustCompile(
+		`\b([+-]?)(VC)?(MI|PR|BC|DR|BL|SH|TS|FZ)?` +
+			`(DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PO|SQ|FC|SS|DS)+\b`,
+	)
 )
 
-// ParseMETAR extracts temperature, wind, and visibility from raw METAR.
-// Also handles SPECI prefix.
+// ParseMETAR extracts temperature, wind, visibility, and present weather.
 func ParseMETAR(raw string) (*Observation, error) {
-	// Detect and strip SPECI prefix for parsing.
 	isSpeci := false
 	parseBody := raw
 	if strings.HasPrefix(raw, "SPECI ") {
@@ -183,6 +199,7 @@ func ParseMETAR(raw string) (*Observation, error) {
 
 	obs := &Observation{Raw: raw, IsSpeci: isSpeci}
 
+	// Temperature / dew-point.
 	tm := reTemp.FindStringSubmatch(body)
 	if tm == nil {
 		return nil, fmt.Errorf("metar parse: temperature not found in %q", raw)
@@ -190,6 +207,7 @@ func ParseMETAR(raw string) (*Observation, error) {
 	obs.TempCelsius = decodeMETARTemp(tm[1])
 	obs.DewPointC = decodeMETARTemp(tm[2])
 
+	// Wind.
 	if wm := reWind.FindStringSubmatch(body); wm != nil {
 		if wm[1] == "VRB" {
 			obs.WindDir = -1
@@ -202,7 +220,12 @@ func ParseMETAR(raw string) (*Observation, error) {
 		}
 	}
 
+	// Visibility.
 	obs.Visibility, obs.VisMeters = extractVisibility(body)
+
+	// Present weather phenomena.
+	wxMatches := reWeather.FindAllString(body, -1)
+	obs.PresentWeather = wxMatches
 
 	return obs, nil
 }
@@ -291,17 +314,18 @@ func decodeVisSM(fracToken, wholeToken string) (string, float64) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Forecast — Open-Meteo JSON mapping
+// Forecast — Open-Meteo JSON mapping (with radiation + humidity)
 // ═══════════════════════════════════════════════════════════════════════════
 
 const openMeteoEndpoint = "https://api.open-meteo.com/v1/forecast"
 
-// OpenMeteoResponse is exported so engine.go can serialize/deserialize
-// it for the forecast cache.
+// OpenMeteoResponse now includes direct_radiation and relative_humidity_2m.
 type OpenMeteoResponse struct {
 	Hourly struct {
-		Time          []string  `json:"time"`
-		Temperature2m []float64 `json:"temperature_2m"`
+		Time               []string  `json:"time"`
+		Temperature2m      []float64 `json:"temperature_2m"`
+		DirectRadiation    []float64 `json:"direct_radiation"`
+		RelativeHumidity2m []float64 `json:"relative_humidity_2m"`
 	} `json:"hourly"`
 
 	Daily struct {
@@ -327,11 +351,9 @@ func FetchForecast(ctx context.Context, apt Airport) (*HourlyForecast, error) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// FetchFullForecastFromAPI — hits Open-Meteo directly (no cache)
+// FetchFullForecastFromAPI — hits Open-Meteo directly
 // ═══════════════════════════════════════════════════════════════════════════
 
-// FetchFullForecastFromAPI retrieves fresh data from Open-Meteo.
-// Returns the parsed FullForecast AND the raw JSON string for caching.
 func FetchFullForecastFromAPI(ctx context.Context, apt Airport) (*FullForecast, error) {
 	_, rawJSON, err := fetchOpenMeteoRaw(ctx, apt)
 	if err != nil {
@@ -340,8 +362,7 @@ func FetchFullForecastFromAPI(ctx context.Context, apt Airport) (*FullForecast, 
 	return ParseForecastJSON(rawJSON, apt)
 }
 
-// FetchOpenMeteoRawJSON fetches from API and returns the raw JSON string
-// for caching, plus the parsed response.
+// FetchOpenMeteoRawJSON returns the raw JSON for caching.
 func FetchOpenMeteoRawJSON(ctx context.Context, apt Airport) (string, error) {
 	_, rawJSON, err := fetchOpenMeteoRaw(ctx, apt)
 	if err != nil {
@@ -350,12 +371,10 @@ func FetchOpenMeteoRawJSON(ctx context.Context, apt Airport) (string, error) {
 	return rawJSON, nil
 }
 
-// fetchOpenMeteoRaw does the HTTP call and returns both the parsed struct
-// and the raw JSON bytes (for caching).
 func fetchOpenMeteoRaw(ctx context.Context, apt Airport) (*OpenMeteoResponse, string, error) {
 	endpoint := fmt.Sprintf(
 		"%s?latitude=%.4f&longitude=%.4f"+
-			"&hourly=temperature_2m"+
+			"&hourly=temperature_2m,direct_radiation,relative_humidity_2m"+
 			"&daily=temperature_2m_max,temperature_2m_min"+
 			"&timezone=%s"+
 			"&forecast_days=2",
@@ -381,7 +400,7 @@ func fetchOpenMeteoRaw(ctx context.Context, apt Airport) (*OpenMeteoResponse, st
 		return nil, "", fmt.Errorf("forecast %s: HTTP %d: %s", apt.ICAO, resp.StatusCode, body)
 	}
 
-	rawBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	rawBytes, err := io.ReadAll(io.LimitReader(resp.Body, 128<<10))
 	if err != nil {
 		return nil, "", fmt.Errorf("forecast %s: read body: %w", apt.ICAO, err)
 	}
@@ -402,19 +421,14 @@ func fetchOpenMeteoRaw(ctx context.Context, apt Airport) (*OpenMeteoResponse, st
 // ParseForecastJSON — parses cached or fresh JSON into FullForecast
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ParseForecastJSON takes raw Open-Meteo JSON (from cache or API) and
-// parses it relative to the airport's current local time.
 func ParseForecastJSON(rawJSON string, apt Airport) (*FullForecast, error) {
 	var payload OpenMeteoResponse
 	if err := json.Unmarshal([]byte(rawJSON), &payload); err != nil {
 		return nil, fmt.Errorf("forecast %s: parse cached JSON: %w", apt.ICAO, err)
 	}
-
 	return parseFullForecast(apt, payload)
 }
 
-// parseFullForecast does the heavy lifting: matches current hour,
-// collects next-6 upcoming points, and extracts daily extremes.
 func parseFullForecast(apt Airport, p OpenMeteoResponse) (*FullForecast, error) {
 	loc, err := time.LoadLocation(apt.Timezone)
 	if err != nil {
@@ -427,36 +441,65 @@ func parseFullForecast(apt Airport, p OpenMeteoResponse) (*FullForecast, error) 
 
 	ff := &FullForecast{}
 
-	for i, ts := range p.Hourly.Time {
-		if i >= len(p.Hourly.Temperature2m) {
-			break
-		}
+	nTimes := len(p.Hourly.Time)
+	nTemps := len(p.Hourly.Temperature2m)
+	nRad := len(p.Hourly.DirectRadiation)
+	nHum := len(p.Hourly.RelativeHumidity2m)
+
+	for i := 0; i < nTimes; i++ {
+		ts := p.Hourly.Time[i]
 
 		parsed, perr := time.ParseInLocation("2006-01-02T15:04", ts, loc)
 		if perr != nil {
 			continue
 		}
 
-		hp := HourlyForecast{
+		// Basic hourly point.
+		var temp float64
+		if i < nTemps {
+			temp = p.Hourly.Temperature2m[i]
+		}
+
+		hp := HourlyForecast{Time: parsed, TempCelsius: temp}
+
+		// Extended hourly point (with radiation + humidity).
+		ext := HourlyExtended{
 			Time:        parsed,
-			TempCelsius: p.Hourly.Temperature2m[i],
+			TempCelsius: temp,
+		}
+		if i < nRad {
+			ext.DirectRadiation = p.Hourly.DirectRadiation[i]
+		}
+		if i < nHum {
+			ext.RelativeHumidity = p.Hourly.RelativeHumidity2m[i]
 		}
 
+		// Current-hour match.
 		if ts == currentHourKey && ff.CurrentHour == nil {
-			cpy := hp
-			ff.CurrentHour = &cpy
+			hpCopy := hp
+			ff.CurrentHour = &hpCopy
+			extCopy := ext
+			ff.CurrentExtended = &extCopy
 		}
 
+		// Upcoming hours.
 		if !parsed.Before(now) && len(ff.Upcoming) < 6 {
 			ff.Upcoming = append(ff.Upcoming, hp)
+			ff.UpcomingExtended = append(ff.UpcomingExtended, ext)
 		}
 	}
 
+	// Fallback: use first upcoming as current.
 	if ff.CurrentHour == nil && len(ff.Upcoming) > 0 {
 		cpy := ff.Upcoming[0]
 		ff.CurrentHour = &cpy
 	}
+	if ff.CurrentExtended == nil && len(ff.UpcomingExtended) > 0 {
+		cpy := ff.UpcomingExtended[0]
+		ff.CurrentExtended = &cpy
+	}
 
+	// Daily extremes.
 	for i, ds := range p.Daily.Time {
 		if ds != todayKey {
 			continue
@@ -507,7 +550,6 @@ func (ws *WeatherState) Update(tempC float64, apt Airport) error {
 
 	ws.Current = tempC
 	ws.LastUpdated = now.UTC()
-
 	return nil
 }
 
