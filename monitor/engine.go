@@ -16,10 +16,13 @@ import (
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Engine configuration
+// Configuration
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ForecastCacheTTL = 3 * time.Hour
+const (
+	ForecastCacheTTL = 3 * time.Hour
+	RetentionPeriod  = 30 * 24 * time.Hour // 30 days
+)
 
 type EngineConfig struct {
 	PollInterval time.Duration
@@ -33,7 +36,7 @@ func DefaultEngineConfig() EngineConfig {
 		PollInterval: 60 * time.Second,
 		FetchTimeout: 30 * time.Second,
 		ChatIDs:      nil,
-		PurgeAge:     30 * 24 * time.Hour,
+		PurgeAge:     RetentionPeriod,
 	}
 }
 
@@ -70,9 +73,9 @@ func NewEngine(db *gorm.DB, bot *tele.Bot, cfg EngineConfig) *Engine {
 func StartMonitoring(db *gorm.DB, bot *tele.Bot, chatIDs []int64) *Engine {
 	cfg := DefaultEngineConfig()
 	cfg.ChatIDs = chatIDs
-	engine := NewEngine(db, bot, cfg)
-	engine.Start()
-	return engine
+	e := NewEngine(db, bot, cfg)
+	e.Start()
+	return e
 }
 
 func (e *Engine) Start() {
@@ -82,8 +85,8 @@ func (e *Engine) Start() {
 	e.wg.Add(1)
 	go e.purgeLoop()
 
-	log.Printf("[engine] started (poll: %s, forecast TTL: %s)",
-		e.cfg.PollInterval, ForecastCacheTTL)
+	log.Printf("[engine] started (poll:%s, retention:%s, cache TTL:%s)",
+		e.cfg.PollInterval, e.cfg.PurgeAge, ForecastCacheTTL)
 }
 
 func (e *Engine) Stop() {
@@ -141,7 +144,11 @@ func (e *Engine) tick() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Per-airport processing
+// Per-airport processing — EVENT-DRIVEN LOGGING
+//
+// The DB log is written ONLY when the METAR text changes (i.e., when
+// a notification would be triggered). This gives us one record per
+// actual weather observation rather than one per poll cycle.
 // ═══════════════════════════════════════════════════════════════════════════
 
 func (e *Engine) processAirport(apt storage.Airport) {
@@ -158,24 +165,51 @@ func (e *Engine) processAirport(apt storage.Airport) {
 		return
 	}
 
+	// ── Early exit: has the raw METAR actually changed? ─────────────────
+
+	metarChanged := e.hasRawChanged(apt.ICAO, obs.Raw)
+	if !metarChanged {
+		// Nothing new — update in-memory state quietly and return.
+		e.ensureState(apt.ICAO, monitorApt)
+		_ = e.states[apt.ICAO].Update(obs.TempCelsius, monitorApt)
+		if hpa, ok := ParsePressure(obs.Raw); ok {
+			e.pressure[apt.ICAO].Record(time.Now(), hpa)
+		}
+		return
+	}
+
+	// METAR changed — proceed with full processing.
+	e.setLastRaw(apt.ICAO, obs.Raw)
+
 	// ── Step B (CONDITIONAL): Smart Forecast Fetch ──────────────────────
 
 	ff, forecastSource := e.getOrFetchForecast(ctx, apt.ICAO, monitorApt)
 
-	// ── Step C: Calculate delta ─────────────────────────────────────────
+	// ── Step C: Calculate delta (Forecast − Reality) ────────────────────
 
 	var forecastTemp, delta float64
 	var condition string
 
 	if ff != nil && ff.CurrentHour != nil {
 		forecastTemp = ff.CurrentHour.TempCelsius
-		delta = obs.TempCelsius - forecastTemp
+		delta = forecastTemp - obs.TempCelsius // positive = warm bias
 		condition = classifyDelta(delta)
 	} else {
 		condition = "NoForecast"
 	}
 
-	// ── Step D: Sensor bias check ───────────────────────────────────────
+	// ── Step D: Derive contextual flags from METAR ──────────────────────
+
+	windSpeedMS := KnotsToMS(obs.WindSpeed)
+	isRaining := hasRainOrShowers(obs.PresentWeather)
+	isFoggy := hasFogOrMist(obs.PresentWeather)
+
+	var directRadiation float64
+	if ff != nil && ff.CurrentExtended != nil {
+		directRadiation = ff.CurrentExtended.DirectRadiation
+	}
+
+	// ── Step E: Sensor bias check ───────────────────────────────────────
 
 	var sensorWarnings []SensorWarning
 	var currentExt *HourlyExtended
@@ -184,7 +218,7 @@ func (e *Engine) processAirport(apt storage.Airport) {
 	}
 	sensorWarnings = CheckSensorBias(obs, currentExt)
 
-	// ── Step E: Update in-memory state ──────────────────────────────────
+	// ── Step F: Update in-memory state ──────────────────────────────────
 
 	e.ensureState(apt.ICAO, monitorApt)
 
@@ -194,30 +228,37 @@ func (e *Engine) processAirport(apt storage.Airport) {
 
 	_ = e.states[apt.ICAO].Update(obs.TempCelsius, monitorApt)
 
-	// ── Step F (ALWAYS): Save to DB ─────────────────────────────────────
+	// ── Step G (EVENT-DRIVEN): Save to DB only on change ────────────────
 
 	wlog := &storage.WeatherLog{
-		AirportICAO:  apt.ICAO,
-		Timestamp:    time.Now().UTC(),
-		ForecastTemp: forecastTemp,
-		RealTemp:     obs.TempCelsius,
-		Delta:        delta,
-		Condition:    condition,
-		IsSpeci:      obs.IsSpeci,
+		AirportICAO:     apt.ICAO,
+		Timestamp:       time.Now().UTC(),
+		ForecastTemp:    forecastTemp,
+		RealTemp:        obs.TempCelsius,
+		Delta:           delta,
+		Condition:       condition,
+		IsSpeci:         obs.IsSpeci,
+		WindSpeed:       windSpeedMS,
+		DirectRadiation: directRadiation,
+		IsRaining:       isRaining,
+		IsFoggy:         isFoggy,
+		RawMETAR:        obs.Raw,
 	}
+
 	if err := storage.InsertWeatherLog(e.db, wlog); err != nil {
 		log.Printf("[engine][%s] DB insert: %v", apt.ICAO, err)
 	}
 
-	// ── Step G (CONDITIONAL): Notify ────────────────────────────────────
+	// ── Step H (CONDITIONAL): Telegram notification ─────────────────────
 
 	if apt.IsMuted {
+		label := "METAR"
+		if obs.IsSpeci {
+			label = "⚡SPECI"
+		}
+		log.Printf("[engine][%s] %s logged (muted, no notify)", apt.ICAO, label)
 		return
 	}
-	if !e.hasRawChanged(apt.ICAO, obs.Raw) {
-		return
-	}
-	e.setLastRaw(apt.ICAO, obs.Raw)
 
 	snapshot := e.states[apt.ICAO].Snapshot()
 	msg := buildFullMessage(apt, obs, ff, snapshot, e.pressure[apt.ICAO],
@@ -229,9 +270,9 @@ func (e *Engine) processAirport(apt storage.Airport) {
 
 	label := "METAR"
 	if obs.IsSpeci {
-		label = "⚡ SPECI"
+		label = "⚡SPECI"
 	}
-	log.Printf("[engine][%s] %s sent (%.1f°C, Δ%.1f°C, %s, src:%s, warnings:%d)",
+	log.Printf("[engine][%s] %s logged+notified (%.1f°C, Δ%+.1f°C, %s, src:%s, warn:%d)",
 		apt.ICAO, label, obs.TempCelsius, delta, condition,
 		forecastSource, len(sensorWarnings))
 }
@@ -241,10 +282,9 @@ func (e *Engine) processAirport(apt storage.Airport) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 func (e *Engine) getOrFetchForecast(
-	ctx context.Context,
-	icao string,
-	apt Airport,
+	ctx context.Context, icao string, apt Airport,
 ) (*FullForecast, string) {
+
 	cached, err := storage.GetForecastCache(e.db, icao)
 	if err == nil && storage.IsForecastCacheFresh(cached, ForecastCacheTTL) {
 		ff, parseErr := ParseForecastJSON(cached.ResponseJSON, apt)
@@ -252,7 +292,7 @@ func (e *Engine) getOrFetchForecast(
 			ff.FromCache = true
 			return ff, "cache"
 		}
-		log.Printf("[engine][%s] cache parse error: %v", icao, parseErr)
+		log.Printf("[engine][%s] cache parse: %v", icao, parseErr)
 	}
 
 	rawJSON, fetchErr := FetchOpenMeteoRawJSON(ctx, apt)
@@ -268,16 +308,12 @@ func (e *Engine) getOrFetchForecast(
 		return nil, "unavailable"
 	}
 
-	if cacheErr := storage.UpsertForecastCache(e.db, icao, rawJSON); cacheErr != nil {
-		log.Printf("[engine][%s] cache save: %v", icao, cacheErr)
-	}
+	_ = storage.UpsertForecastCache(e.db, icao, rawJSON)
 
 	ff, parseErr := ParseForecastJSON(rawJSON, apt)
 	if parseErr != nil {
-		log.Printf("[engine][%s] fresh parse error: %v", icao, parseErr)
 		return nil, "parse-error"
 	}
-
 	return ff, "api"
 }
 
@@ -308,13 +344,11 @@ func buildFullMessage(
 	if obs.IsSpeci {
 		b.WriteString("⚡️ *URGENT (SPECI)*\n")
 	}
-
 	b.WriteString("🛫 *")
 	b.WriteString(apt.City)
 	b.WriteString(" (")
 	b.WriteString(apt.ICAO)
-	b.WriteString(")*\n")
-	b.WriteString("🕐 ")
+	b.WriteString(")*\n🕐 ")
 	b.WriteString(localNow.Format("Mon, 02 Jan 2006 15:04 MST"))
 	if obs.IsSpeci {
 		b.WriteString("  ⚡️")
@@ -323,8 +357,7 @@ func buildFullMessage(
 
 	// ── REAL-TIME CONDITIONS ────────────────────────────────────────────
 
-	b.WriteString("📡 *REAL-TIME CONDITIONS*\n")
-	b.WriteString("```\n")
+	b.WriteString("📡 *REAL-TIME CONDITIONS*\n```\n")
 	fmt.Fprintf(&b, "Temperature : %s\n", FormatTemp(obs.TempCelsius))
 	fmt.Fprintf(&b, "Wind        : %s\n", fmtWind(obs))
 	fmt.Fprintf(&b, "Visibility  : %s\n", obs.Visibility)
@@ -348,15 +381,13 @@ func buildFullMessage(
 	if obs.IsSpeci {
 		b.WriteString("⚡ Type       : SPECI (Special Obs)\n")
 	}
-
 	b.WriteString("```\n\n")
 
 	// ── DAY STATISTICS ──────────────────────────────────────────────────
 
 	b.WriteString("📊 *DAY STATISTICS* (")
 	b.WriteString(snap.TrackingDay.Format("02 Jan"))
-	b.WriteString(")\n")
-	b.WriteString("```\n")
+	b.WriteString(")\n```\n")
 	if math.IsInf(snap.DailyHigh, 0) {
 		b.WriteString("Awaiting first observation...\n")
 	} else {
@@ -369,17 +400,22 @@ func buildFullMessage(
 
 	b.WriteString("🎯 *FORECAST vs REALITY*\n")
 	if ff != nil && ff.CurrentHour != nil {
-		delta := obs.TempCelsius - ff.CurrentHour.TempCelsius
+		delta := ff.CurrentHour.TempCelsius - obs.TempCelsius
 		cacheTag := ""
 		if ff.FromCache {
 			cacheTag = fmt.Sprintf(" (%s)", forecastSource)
+		}
+		biasLabel := "neutral"
+		if delta > 0.05 {
+			biasLabel = "warm bias"
+		} else if delta < -0.05 {
+			biasLabel = "cool bias"
 		}
 		b.WriteString("```\n")
 		fmt.Fprintf(&b, "Forecast    : %s%s\n", FormatTemp(ff.CurrentHour.TempCelsius), cacheTag)
 		fmt.Fprintf(&b, "Reality     : %s\n", FormatTemp(obs.TempCelsius))
 		fmt.Fprintf(&b, "Delta       : %s\n", FormatDelta(delta))
-		fmt.Fprintf(&b, "Verdict     : %s (%s)\n",
-			classifyDelta(delta), narrative(delta))
+		fmt.Fprintf(&b, "Verdict     : %s (%s)\n", classifyDelta(delta), biasLabel)
 		b.WriteString("```\n\n")
 	} else {
 		b.WriteString("_Forecast data not available_\n\n")
@@ -393,9 +429,7 @@ func buildFullMessage(
 		for _, hp := range ff.Upcoming {
 			localHour := hp.Time.In(loc)
 			fmt.Fprintf(&b, "%s : %s\n",
-				localHour.Format("15:04"),
-				FormatTemp(hp.TempCelsius),
-			)
+				localHour.Format("15:04"), FormatTemp(hp.TempCelsius))
 		}
 		if ff.HasDailyExtremes {
 			b.WriteString("\n")
@@ -407,11 +441,10 @@ func buildFullMessage(
 		b.WriteString("_Outlook not available_\n")
 	}
 
-	// ── SENSOR QA (new section) ─────────────────────────────────────────
+	// ── SENSOR QA ───────────────────────────────────────────────────────
 
 	if len(sensorWarnings) > 0 {
-		b.WriteString("\n⚠️ *SENSOR QA*\n")
-		b.WriteString("```\n")
+		b.WriteString("\n⚠️ *SENSOR QA*\n```\n")
 		for _, w := range sensorWarnings {
 			fmt.Fprintf(&b, "%s %s\n  %s\n", w.Icon, w.Title, w.Detail)
 		}
@@ -428,9 +461,7 @@ func buildFullMessage(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Engine-local helpers
-//
-// FormatTemp, FormatDelta, tempSign → analyze.go
+// Engine-local helpers (FormatTemp, FormatDelta, tempSign → analyze.go)
 // ═══════════════════════════════════════════════════════════════════════════
 
 func fmtWind(obs *Observation) string {
@@ -441,7 +472,7 @@ func fmtWind(obs *Observation) string {
 	if obs.WindDir >= 0 {
 		dir = fmt.Sprintf("%03d°", obs.WindDir)
 	}
-	s := fmt.Sprintf("%s @ %dkt", dir, obs.WindSpeed)
+	s := fmt.Sprintf("%s @ %dkt (%.1f m/s)", dir, obs.WindSpeed, KnotsToMS(obs.WindSpeed))
 	if obs.WindGust > 0 {
 		s += fmt.Sprintf(", gusting %dkt", obs.WindGust)
 	}
@@ -449,13 +480,13 @@ func fmtWind(obs *Observation) string {
 }
 
 func classifyDelta(delta float64) string {
-	abs := math.Abs(delta)
+	ad := math.Abs(delta)
 	switch {
-	case abs < 1.0:
-		return "Accurate"
-	case abs < 2.5:
-		return "Close"
-	case abs < 5.0:
+	case ad < 0.5:
+		return "Excellent"
+	case ad < 1.0:
+		return "Good"
+	case ad < 2.0:
 		return "Off"
 	default:
 		return "Poor"
@@ -465,21 +496,30 @@ func classifyDelta(delta float64) string {
 func narrative(delta float64) string {
 	switch {
 	case delta > 0.05:
-		return "warmer than forecast"
+		return "warm bias"
 	case delta < -0.05:
-		return "cooler than forecast"
+		return "cool bias"
 	default:
-		return "matches forecast"
+		return "neutral"
 	}
+}
+
+// hasFogOrMist checks for FG or BR in present weather.
+func hasFogOrMist(wx []string) bool {
+	for _, w := range wx {
+		u := strings.ToUpper(w)
+		if strings.Contains(u, "FG") || strings.Contains(u, "BR") {
+			return true
+		}
+	}
+	return false
 }
 
 func storageToMonitorAirport(a storage.Airport) Airport {
 	return Airport{
-		ICAO:      a.ICAO,
-		City:      a.City,
-		Latitude:  a.Lat,
-		Longitude: a.Lon,
-		Timezone:  a.Timezone,
+		ICAO: a.ICAO, City: a.City,
+		Latitude: a.Lat, Longitude: a.Lon,
+		Timezone: a.Timezone,
 	}
 }
 
@@ -492,8 +532,7 @@ func (e *Engine) ensureState(icao string, apt Airport) {
 		now := time.Now().In(loc)
 		midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 		e.states[icao] = &WeatherState{
-			DailyHigh:   math.Inf(-1),
-			DailyLow:    math.Inf(1),
+			DailyHigh: math.Inf(-1), DailyLow: math.Inf(1),
 			TrackingDay: midnight,
 		}
 	}
@@ -506,10 +545,7 @@ func (e *Engine) hasRawChanged(icao, raw string) bool {
 	e.lastRawMu.RLock()
 	defer e.lastRawMu.RUnlock()
 	prev, exists := e.lastRaw[icao]
-	if !exists {
-		return true
-	}
-	return prev != raw
+	return !exists || prev != raw
 }
 
 func (e *Engine) setLastRaw(icao, raw string) {
@@ -530,7 +566,7 @@ func (e *Engine) sendToChat(chatID int64, msg string) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Purge loop
+// Purge loop — daily cleanup, 30-day retention
 // ═══════════════════════════════════════════════════════════════════════════
 
 func (e *Engine) purgeLoop() {
@@ -555,13 +591,13 @@ func (e *Engine) purge() {
 	if err != nil {
 		log.Printf("[engine] purge logs: %v", err)
 	} else if deleted > 0 {
-		log.Printf("[engine] purged %d old weather logs", deleted)
+		log.Printf("[engine] purged %d logs older than %s", deleted, e.cfg.PurgeAge)
 	}
 
-	fcDeleted, fcErr := storage.PurgeForecastCache(e.db, 24*time.Hour)
+	fc, fcErr := storage.PurgeForecastCache(e.db, 24*time.Hour)
 	if fcErr != nil {
 		log.Printf("[engine] purge cache: %v", fcErr)
-	} else if fcDeleted > 0 {
-		log.Printf("[engine] purged %d stale cache entries", fcDeleted)
+	} else if fc > 0 {
+		log.Printf("[engine] purged %d stale forecast cache entries", fc)
 	}
 }
