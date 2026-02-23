@@ -19,6 +19,12 @@ import (
 // Engine configuration
 // ═══════════════════════════════════════════════════════════════════════════
 
+const (
+	// ForecastCacheTTL controls how long a cached forecast is considered
+	// fresh. Open-Meteo updates hourly, so 3 hours is a safe middle ground.
+	ForecastCacheTTL = 3 * time.Hour
+)
+
 type EngineConfig struct {
 	PollInterval time.Duration
 	FetchTimeout time.Duration
@@ -28,7 +34,7 @@ type EngineConfig struct {
 
 func DefaultEngineConfig() EngineConfig {
 	return EngineConfig{
-		PollInterval: 60 * time.Second,
+		PollInterval: 60 * time.Second, // back to 60s for SPECI support
 		FetchTimeout: 30 * time.Second,
 		ChatIDs:      nil,
 		PurgeAge:     30 * 24 * time.Hour,
@@ -80,7 +86,8 @@ func (e *Engine) Start() {
 	e.wg.Add(1)
 	go e.purgeLoop()
 
-	log.Println("[engine] monitoring started")
+	log.Printf("[engine] monitoring started (poll: %s, forecast TTL: %s)",
+		e.cfg.PollInterval, ForecastCacheTTL)
 }
 
 func (e *Engine) Stop() {
@@ -142,14 +149,16 @@ func (e *Engine) tick() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Per-airport processing
+// Per-airport processing (with smart forecast caching)
 // ═══════════════════════════════════════════════════════════════════════════
 
 func (e *Engine) processAirport(apt storage.Airport) {
 	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.FetchTimeout)
 	defer cancel()
 
-	// ── 1. Fetch METAR ──────────────────────────────────────────────────
+	monitorApt := storageToMonitorAirport(apt)
+
+	// ── Step A (ALWAYS): Fetch latest METAR / SPECI ─────────────────────
 
 	obs, err := FetchMETAR(ctx, apt.ICAO)
 	if err != nil {
@@ -157,17 +166,19 @@ func (e *Engine) processAirport(apt storage.Airport) {
 		return
 	}
 
-	// ── 2. Fetch FULL forecast (hourly array + daily max/min) ───────────
-
-	monitorApt := storageToMonitorAirport(apt)
-
-	var ff *FullForecast
-	ff, err = FetchFullForecast(ctx, monitorApt)
-	if err != nil {
-		log.Printf("[engine][%s] forecast (non-fatal): %v", apt.ICAO, err)
+	if obs.IsSpeci {
+		log.Printf("[engine][%s] ⚡ SPECI detected", apt.ICAO)
 	}
 
-	// ── 3. Calculate delta ──────────────────────────────────────────────
+	// ── Step B (CONDITIONAL): Smart Forecast Fetch ───────────────────────
+
+	ff, forecastSource := e.getOrFetchForecast(ctx, apt.ICAO, monitorApt)
+
+	if ff != nil {
+		log.Printf("[engine][%s] forecast source: %s", apt.ICAO, forecastSource)
+	}
+
+	// ── Step C: Calculate delta ─────────────────────────────────────────
 
 	var forecastTemp, delta float64
 	var condition string
@@ -180,7 +191,7 @@ func (e *Engine) processAirport(apt storage.Airport) {
 		condition = "NoForecast"
 	}
 
-	// ── 4. Update in-memory state ───────────────────────────────────────
+	// ── Step D: Update in-memory state ──────────────────────────────────
 
 	e.ensureState(apt.ICAO, monitorApt)
 
@@ -190,7 +201,7 @@ func (e *Engine) processAirport(apt storage.Airport) {
 
 	_ = e.states[apt.ICAO].Update(obs.TempCelsius, monitorApt)
 
-	// ── 5. ALWAYS save to DB ────────────────────────────────────────────
+	// ── Step E (ALWAYS): Save to DB ─────────────────────────────────────
 
 	wlog := &storage.WeatherLog{
 		AirportICAO:  apt.ICAO,
@@ -199,13 +210,14 @@ func (e *Engine) processAirport(apt storage.Airport) {
 		RealTemp:     obs.TempCelsius,
 		Delta:        delta,
 		Condition:    condition,
+		IsSpeci:      obs.IsSpeci,
 	}
 
 	if err := storage.InsertWeatherLog(e.db, wlog); err != nil {
 		log.Printf("[engine][%s] DB insert: %v", apt.ICAO, err)
 	}
 
-	// ── 6. CONDITIONALLY notify ─────────────────────────────────────────
+	// ── Step F (CONDITIONAL): Notify via Telegram ───────────────────────
 
 	if apt.IsMuted {
 		return
@@ -224,14 +236,73 @@ func (e *Engine) processAirport(apt storage.Airport) {
 		e.sendToChat(chatID, msg)
 	}
 
-	log.Printf("[engine][%s] notified (%.1f°C, Δ %.1f°C, %s)",
-		apt.ICAO, obs.TempCelsius, delta, condition)
+	label := "METAR"
+	if obs.IsSpeci {
+		label = "⚡ SPECI"
+	}
+	log.Printf("[engine][%s] %s notified (%.1f°C, Δ %.1f°C, %s, forecast: %s)",
+		apt.ICAO, label, obs.TempCelsius, delta, condition, forecastSource)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Full message builder (with Daily Outlook)
-//
-// NOTE: FormatTemp, FormatDelta, tempSign live in analyze.go
+// Smart forecast caching
+// ═══════════════════════════════════════════════════════════════════════════
+
+// getOrFetchForecast checks the DB cache first. If the cache is fresh
+// (< ForecastCacheTTL), it parses and returns the cached JSON. Otherwise
+// it fetches fresh data from Open-Meteo and updates the cache.
+func (e *Engine) getOrFetchForecast(
+	ctx context.Context,
+	icao string,
+	apt Airport,
+) (*FullForecast, string) {
+
+	// Check cache.
+	cached, err := storage.GetForecastCache(e.db, icao)
+	if err == nil && storage.IsForecastCacheFresh(cached, ForecastCacheTTL) {
+		// Cache hit — parse the stored JSON.
+		ff, parseErr := ParseForecastJSON(cached.ResponseJSON, apt)
+		if parseErr == nil {
+			ff.FromCache = true
+			return ff, "cache"
+		}
+		log.Printf("[engine][%s] cache parse error (will refetch): %v", icao, parseErr)
+	}
+
+	// Cache miss or stale — fetch from API.
+	rawJSON, fetchErr := FetchOpenMeteoRawJSON(ctx, apt)
+	if fetchErr != nil {
+		log.Printf("[engine][%s] forecast API (non-fatal): %v", icao, fetchErr)
+
+		// Last resort: try stale cache if we have one.
+		if cached != nil && cached.ResponseJSON != "" {
+			ff, parseErr := ParseForecastJSON(cached.ResponseJSON, apt)
+			if parseErr == nil {
+				ff.FromCache = true
+				return ff, "stale-cache"
+			}
+		}
+
+		return nil, "unavailable"
+	}
+
+	// Save fresh response to cache.
+	if cacheErr := storage.UpsertForecastCache(e.db, icao, rawJSON); cacheErr != nil {
+		log.Printf("[engine][%s] cache save error: %v", icao, cacheErr)
+	}
+
+	// Parse the fresh JSON.
+	ff, parseErr := ParseForecastJSON(rawJSON, apt)
+	if parseErr != nil {
+		log.Printf("[engine][%s] fresh forecast parse error: %v", icao, parseErr)
+		return nil, "parse-error"
+	}
+
+	return ff, "api"
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Full message builder (with SPECI indicator + Daily Outlook)
 // ═══════════════════════════════════════════════════════════════════════════
 
 func buildFullMessage(
@@ -242,7 +313,7 @@ func buildFullMessage(
 	pt *PressureTracker,
 ) string {
 	var b strings.Builder
-	b.Grow(1600)
+	b.Grow(1800)
 
 	loc, _ := time.LoadLocation(apt.Timezone)
 	if loc == nil {
@@ -252,6 +323,10 @@ func buildFullMessage(
 
 	// ── HEADER ──────────────────────────────────────────────────────────
 
+	if obs.IsSpeci {
+		b.WriteString("⚡️ *URGENT (SPECI)*\n")
+	}
+
 	b.WriteString("🛫 *")
 	b.WriteString(apt.City)
 	b.WriteString(" (")
@@ -259,6 +334,11 @@ func buildFullMessage(
 	b.WriteString(")*\n")
 	b.WriteString("🕐 ")
 	b.WriteString(localNow.Format("Mon, 02 Jan 2006 15:04 MST"))
+
+	if obs.IsSpeci {
+		b.WriteString("  ⚡️")
+	}
+
 	b.WriteString("\n\n")
 
 	// ── REAL-TIME CONDITIONS ────────────────────────────────────────────
@@ -280,6 +360,11 @@ func buildFullMessage(
 			}
 		}
 	}
+
+	if obs.IsSpeci {
+		b.WriteString("⚡ Type       : SPECI (Special Obs)\n")
+	}
+
 	b.WriteString("```\n\n")
 
 	// ── DAY STATISTICS ──────────────────────────────────────────────────
@@ -301,8 +386,12 @@ func buildFullMessage(
 	b.WriteString("🎯 *FORECAST vs REALITY*\n")
 	if ff != nil && ff.CurrentHour != nil {
 		delta := obs.TempCelsius - ff.CurrentHour.TempCelsius
+		cacheTag := ""
+		if ff.FromCache {
+			cacheTag = " (cached)"
+		}
 		b.WriteString("```\n")
-		fmt.Fprintf(&b, "Forecast    : %s\n", FormatTemp(ff.CurrentHour.TempCelsius))
+		fmt.Fprintf(&b, "Forecast    : %s%s\n", FormatTemp(ff.CurrentHour.TempCelsius), cacheTag)
 		fmt.Fprintf(&b, "Reality     : %s\n", FormatTemp(obs.TempCelsius))
 		fmt.Fprintf(&b, "Delta       : %s\n", FormatDelta(delta))
 		fmt.Fprintf(&b, "Verdict     : %s (%s)\n",
@@ -347,12 +436,11 @@ func buildFullMessage(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Engine-local helpers (NOT duplicated from analyze.go)
+// Engine-local helpers
+//
+// FormatTemp, FormatDelta, tempSign → defined in analyze.go
 // ═══════════════════════════════════════════════════════════════════════════
 
-// fmtWind formats wind for the message block.
-// Named differently from formatWind in analyze.go to avoid collision
-// if both files evolve independently.
 func fmtWind(obs *Observation) string {
 	if obs.WindSpeed == 0 && obs.WindGust == 0 {
 		return "Calm"
@@ -368,7 +456,6 @@ func fmtWind(obs *Observation) string {
 	return s
 }
 
-// classifyDelta maps abs(delta) to an accuracy label.
 func classifyDelta(delta float64) string {
 	abs := math.Abs(delta)
 	switch {
@@ -383,7 +470,6 @@ func classifyDelta(delta float64) string {
 	}
 }
 
-// narrative returns a directional description.
 func narrative(delta float64) string {
 	switch {
 	case delta > 0.05:
@@ -484,10 +570,18 @@ func (e *Engine) purgeLoop() {
 func (e *Engine) purge() {
 	deleted, err := storage.PurgeOlderThan(e.db, e.cfg.PurgeAge)
 	if err != nil {
-		log.Printf("[engine] purge: %v", err)
+		log.Printf("[engine] purge logs: %v", err)
 		return
 	}
 	if deleted > 0 {
-		log.Printf("[engine] purged %d old logs", deleted)
+		log.Printf("[engine] purged %d old weather logs", deleted)
+	}
+
+	// Also purge very old forecast cache entries (> 24h).
+	fcDeleted, fcErr := storage.PurgeForecastCache(e.db, 24*time.Hour)
+	if fcErr != nil {
+		log.Printf("[engine] purge forecast cache: %v", fcErr)
+	} else if fcDeleted > 0 {
+		log.Printf("[engine] purged %d stale forecast cache entries", fcDeleted)
 	}
 }
