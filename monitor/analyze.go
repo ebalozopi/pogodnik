@@ -3,8 +3,6 @@ package monitor
 import (
 	"fmt"
 	"math"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -14,10 +12,10 @@ import (
 // ═══════════════════════════════════════════════════════════════════════════
 
 const (
-	AccuracyAccurate = "Accurate"
-	AccuracyClose    = "Close"
-	AccuracyOff      = "Off"
-	AccuracyPoor     = "Poor"
+	AccuracyExcellent = "Excellent"
+	AccuracyGood      = "Good"
+	AccuracyOff       = "Off"
+	AccuracyPoor      = "Poor"
 )
 
 // Sensor bias thresholds.
@@ -30,39 +28,17 @@ const (
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pressure parsing
-// ═══════════════════════════════════════════════════════════════════════════
-
-var (
-	reAltimeterUS  = regexp.MustCompile(`\bA(\d{4})\b`)
-	reAltimeterQNH = regexp.MustCompile(`\bQ(\d{3,4})\b`)
-)
-
-const inHgToHpa = 33.8639
-
-func ParsePressure(raw string) (float64, bool) {
-	if m := reAltimeterQNH.FindStringSubmatch(raw); m != nil {
-		v, _ := strconv.ParseFloat(m[1], 64)
-		return v, true
-	}
-	if m := reAltimeterUS.FindStringSubmatch(raw); m != nil {
-		v, _ := strconv.ParseFloat(m[1], 64)
-		return (v / 100.0) * inHgToHpa, true
-	}
-	return 0, false
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Temperature formatting
+// Temperature formatting — precision-aware
 // ═══════════════════════════════════════════════════════════════════════════
 
 func tempSign(v float64) string {
 	if v < 0 {
-		return ""
+		return "" // negative sign is already included by %f
 	}
 	return "+"
 }
 
+// FormatTemp renders a temperature in both °C and °F.
 func FormatTemp(c float64) string {
 	if math.IsInf(c, 0) || math.IsNaN(c) {
 		return "N/A"
@@ -72,25 +48,85 @@ func FormatTemp(c float64) string {
 		tempSign(c), c, tempSign(f), f)
 }
 
+// FormatTempWithPrecision renders a temperature and appends a tilde (~)
+// prefix when the reading is NOT from a T-Group (integer-only precision).
+//
+//	IsPrecise=true  → "+12.3°C / +54.1°F"
+//	IsPrecise=false → "~+12.0°C / ~+54.0°F"
+func FormatTempWithPrecision(c float64, isPrecise bool) string {
+	if math.IsInf(c, 0) || math.IsNaN(c) {
+		return "N/A"
+	}
+	f := CelsiusToFahrenheit(c)
+	prefix := ""
+	if !isPrecise {
+		prefix = "~"
+	}
+	return fmt.Sprintf("%s%s%.1f°C / %s%s%.1f°F",
+		prefix, tempSign(c), c, prefix, tempSign(f), f)
+}
+
+// FormatDelta renders a delta value with an explicit sign.
+//
+// Strict formula: Delta = Forecast − Reality
+//
+//	Positive → forecast was warmer than reality (warm bias)
+//	Negative → forecast was cooler than reality (cool bias)
 func FormatDelta(deltaC float64) string {
 	deltaF := deltaC * 9.0 / 5.0
-	return fmt.Sprintf("%s%.1f°C / %s%.1f°F",
-		tempSign(deltaC), deltaC,
-		tempSign(deltaF), deltaF)
+	return fmt.Sprintf("%+.1f°C / %+.1f°F", deltaC, deltaF)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Delta classification
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ClassifyDelta returns a human-readable accuracy label based on |delta|.
+func ClassifyDelta(delta float64) string {
+	ad := math.Abs(delta)
+	switch {
+	case ad < 0.5:
+		return AccuracyExcellent
+	case ad < 1.0:
+		return AccuracyGood
+	case ad < 2.0:
+		return AccuracyOff
+	default:
+		return AccuracyPoor
+	}
+}
+
+// BiasNarrative returns the bias direction as a short label.
+//
+//	delta > 0  → "warm bias"  (forecast was too warm)
+//	delta < 0  → "cool bias"  (forecast was too cool)
+//	delta ≈ 0  → "neutral"
+func BiasNarrative(delta float64) string {
+	switch {
+	case delta > 0.05:
+		return "warm bias"
+	case delta < -0.05:
+		return "cool bias"
+	default:
+		return "neutral"
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Report sub-structures
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ObservationReport holds the formatted observation data.
 type ObservationReport struct {
 	TempC       float64
 	TempDisplay string
+	IsPrecise   bool
 	Wind        string
 	Visibility  string
 	RawMETAR    string
 }
 
+// ForecastReport holds the formatted forecast data.
 type ForecastReport struct {
 	Available   bool
 	TempC       float64
@@ -98,15 +134,18 @@ type ForecastReport struct {
 	ValidTime   time.Time
 }
 
+// ComparisonReport holds the delta analysis.
+// Delta = Forecast − Reality (strict formula).
 type ComparisonReport struct {
 	Available    bool
 	DeltaC       float64
 	DeltaF       float64
-	DeltaDisplay string
-	Narrative    string
-	Accuracy     string
+	DeltaDisplay string // always shows sign: "+1.2°C / +2.2°F"
+	Narrative    string // "warm bias", "cool bias", "neutral"
+	Accuracy     string // "Excellent", "Good", "Off", "Poor"
 }
 
+// ExtremesReport holds daily high/low tracking.
 type ExtremesReport struct {
 	HighC       float64
 	HighDisplay string
@@ -116,6 +155,7 @@ type ExtremesReport struct {
 	DayDisplay  string
 }
 
+// PressureReport holds the barometric analysis.
 type PressureReport struct {
 	Available       bool
 	CurrentHpa      float64
@@ -126,11 +166,12 @@ type PressureReport struct {
 
 // SensorWarning represents a single sensor bias warning.
 type SensorWarning struct {
-	Icon    string // emoji
-	Title   string // short label
-	Detail  string // explanation
+	Icon   string // emoji
+	Title  string // short label
+	Detail string // explanation
 }
 
+// Report is the fully assembled analysis for one airport.
 type Report struct {
 	Airport     Airport
 	GeneratedAt time.Time
@@ -145,9 +186,16 @@ type Report struct {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// AnalyzeWeather
+// AnalyzeWeather — builds a Report from raw components
 // ═══════════════════════════════════════════════════════════════════════════
 
+// AnalyzeWeather constructs a full Report from an observation, optional
+// forecast, state snapshot, and pressure tracker.
+//
+// Delta formula: Forecast.Temp − Reality.Temp
+//
+//	+2.0 means forecast predicted warmer than actual (warm bias)
+//	-2.0 means forecast predicted cooler than actual (cool bias)
 func AnalyzeWeather(
 	apt Airport,
 	obs *Observation,
@@ -168,13 +216,18 @@ func AnalyzeWeather(
 		LocalTime:   localNow,
 	}
 
+	// ── Observation ─────────────────────────────────────────────────────
+
 	r.Observation = ObservationReport{
 		TempC:       obs.TempCelsius,
-		TempDisplay: FormatTemp(obs.TempCelsius),
-		Wind:        formatWindAnalyze(obs),
+		TempDisplay: FormatTempWithPrecision(obs.TempCelsius, obs.IsPrecise),
+		IsPrecise:   obs.IsPrecise,
+		Wind:        formatWindForReport(obs),
 		Visibility:  obs.Visibility,
 		RawMETAR:    obs.Raw,
 	}
+
+	// ── Forecast & Comparison ───────────────────────────────────────────
 
 	if fc != nil {
 		r.Forecast = ForecastReport{
@@ -184,16 +237,20 @@ func AnalyzeWeather(
 			ValidTime:   fc.Time,
 		}
 
-		deltaC := obs.TempCelsius - fc.TempCelsius
+		// *** STRICT FORMULA: Delta = Forecast − Reality ***
+		deltaC := fc.TempCelsius - obs.TempCelsius
+
 		r.Comparison = ComparisonReport{
 			Available:    true,
 			DeltaC:       deltaC,
 			DeltaF:       deltaC * 9.0 / 5.0,
 			DeltaDisplay: FormatDelta(deltaC),
-			Narrative:    deltaNarrativeAnalyze(deltaC),
-			Accuracy:     classifyAccuracy(math.Abs(deltaC)),
+			Narrative:    BiasNarrative(deltaC),
+			Accuracy:     ClassifyDelta(deltaC),
 		}
 	}
+
+	// ── Daily Extremes ──────────────────────────────────────────────────
 
 	r.Extremes = ExtremesReport{
 		HighC:       state.DailyHigh,
@@ -204,6 +261,8 @@ func AnalyzeWeather(
 		DayDisplay: fmt.Sprintf("%s (%s)",
 			state.TrackingDay.Format("2006-01-02"), apt.Timezone),
 	}
+
+	// ── Pressure ────────────────────────────────────────────────────────
 
 	if pt != nil {
 		latest, ok := pt.Latest()
@@ -227,47 +286,6 @@ func AnalyzeWeather(
 	}
 
 	return r
-}
-
-func formatWindAnalyze(obs *Observation) string {
-	if obs.WindSpeed == 0 && obs.WindGust == 0 {
-		return "Calm"
-	}
-	var dir string
-	if obs.WindDir < 0 {
-		dir = "VRB"
-	} else {
-		dir = fmt.Sprintf("%03d°", obs.WindDir)
-	}
-	s := fmt.Sprintf("%s @ %dkt", dir, obs.WindSpeed)
-	if obs.WindGust > 0 {
-		s += fmt.Sprintf(", gusting %dkt", obs.WindGust)
-	}
-	return s
-}
-
-func classifyAccuracy(absDelta float64) string {
-	switch {
-	case absDelta < 1.0:
-		return AccuracyAccurate
-	case absDelta < 2.5:
-		return AccuracyClose
-	case absDelta < 5.0:
-		return AccuracyOff
-	default:
-		return AccuracyPoor
-	}
-}
-
-func deltaNarrativeAnalyze(deltaC float64) string {
-	switch {
-	case deltaC > 0.05:
-		return "warmer than forecast"
-	case deltaC < -0.05:
-		return "cooler than forecast"
-	default:
-		return "matches forecast"
-	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -307,16 +325,13 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 	}
 
 	// ── 2. Evaporative (Wet Bulb) Cooling ───────────────────────────────
-	// Rain or showers present + relatively low humidity = evaporation
-	// cools the sensor below true air temperature.
-	// Typical bias: -0.5 to -1.5 °C.
+	// Rain/showers + relatively low humidity = evaporation cools the
+	// sensor below true air temperature. Typical bias: -0.5 to -1.5 °C.
 	if hasRainOrShowers(obs.PresentWeather) {
 		humidity := float64(0)
 		if ext != nil {
 			humidity = ext.RelativeHumidity
 		}
-
-		// Also compute humidity from dew-point depression if no ext data.
 		if humidity == 0 {
 			humidity = estimateHumidity(obs.TempCelsius, obs.DewPointC)
 		}
@@ -339,8 +354,7 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 	}
 
 	// ── 3. Sensor Icing ─────────────────────────────────────────────────
-	// Temp near 0°C + high humidity = moisture freezes on the sensor,
-	// insulating it and causing it to read stale/incorrect values.
+	// Temp near 0°C + high humidity = moisture freezes on the sensor.
 	{
 		humidity := float64(0)
 		if ext != nil {
@@ -358,8 +372,6 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 				"Temp %.1f°C, humidity %.0f%% — sensor may freeze over",
 				obs.TempCelsius, humidity,
 			)
-
-			// Additional risk factors.
 			if hasFreezing(obs.PresentWeather) {
 				detail += " (freezing precip reported)"
 			}
@@ -372,14 +384,13 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 		}
 	}
 
-	// ── 4. Infrared Radiation Cooling (bonus check) ─────────────────────
-	// Clear night + calm wind = sensor radiates heat to sky faster than
+	// ── 4. Infrared Radiation Cooling ───────────────────────────────────
+	// Clear night + calm wind = sensor radiates heat faster than
 	// surrounding air, reading slightly colder.
 	if ext != nil {
 		windMS := KnotsToMS(obs.WindSpeed)
 		isNight := ext.DirectRadiation == 0
-		isClear := obs.Visibility == "CAVOK" ||
-			obs.VisMeters >= 9999
+		isClear := obs.Visibility == "CAVOK" || obs.VisMeters >= 9999
 
 		if isNight && isClear && windMS < 2.0 {
 			warnings = append(warnings, SensorWarning{
@@ -397,63 +408,33 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Sensor bias helper functions
+// Report helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-// hasRainOrShowers checks if any precipitation phenomenon is present.
-func hasRainOrShowers(wx []string) bool {
-	for _, w := range wx {
-		upper := strings.ToUpper(w)
-		if strings.Contains(upper, "RA") ||
-			strings.Contains(upper, "DZ") ||
-			strings.Contains(upper, "SH") {
-			return true
-		}
+func formatWindForReport(obs *Observation) string {
+	if obs.WindSpeed == 0 && obs.WindGust == 0 {
+		return "Calm"
 	}
-	return false
-}
-
-// hasFreezing checks for freezing precipitation (FZRA, FZDZ).
-func hasFreezing(wx []string) bool {
-	for _, w := range wx {
-		upper := strings.ToUpper(w)
-		if strings.Contains(upper, "FZ") {
-			return true
-		}
+	var dir string
+	if obs.WindDir < 0 {
+		dir = "VRB"
+	} else {
+		dir = fmt.Sprintf("%03d°", obs.WindDir)
 	}
-	return false
-}
-
-// estimateHumidity approximates relative humidity from temperature and
-// dew-point using the Magnus formula.
-//
-//	RH ≈ 100 × exp( (17.625 × Td) / (243.04 + Td) − (17.625 × T) / (243.04 + T) )
-func estimateHumidity(tempC, dewPointC float64) float64 {
-	const a = 17.625
-	const b = 243.04
-
-	gamma := (a * dewPointC) / (b + dewPointC) -
-		(a * tempC) / (b + tempC)
-
-	rh := 100.0 * math.Exp(gamma)
-
-	if rh > 100 {
-		rh = 100
+	s := fmt.Sprintf("%s @ %dkt", dir, obs.WindSpeed)
+	if obs.WindGust > 0 {
+		s += fmt.Sprintf(", gusting %dkt", obs.WindGust)
 	}
-	if rh < 0 {
-		rh = 0
-	}
-
-	return rh
+	return s
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Report.String — terminal rendering
+// Report.String — terminal/log rendering
 // ═══════════════════════════════════════════════════════════════════════════
 
 func (r *Report) String() string {
 	var b strings.Builder
-	b.Grow(1200)
+	b.Grow(1400)
 
 	divider := "═══════════════════════════════════════════════════════════"
 
@@ -466,7 +447,11 @@ func (r *Report) String() string {
 	b.WriteByte('\n')
 
 	b.WriteString("\n  Observation (METAR)\n")
-	fmt.Fprintf(&b, "    Temperature : %s\n", r.Observation.TempDisplay)
+	precLabel := "T-Group 0.1°C"
+	if !r.Observation.IsPrecise {
+		precLabel = "standard ±1°C"
+	}
+	fmt.Fprintf(&b, "    Temperature : %s [%s]\n", r.Observation.TempDisplay, precLabel)
 	fmt.Fprintf(&b, "    Wind        : %s\n", r.Observation.Wind)
 	fmt.Fprintf(&b, "    Visibility  : %s\n", r.Observation.Visibility)
 
@@ -477,7 +462,7 @@ func (r *Report) String() string {
 		b.WriteString("    (not available)\n")
 	}
 
-	b.WriteString("\n  Forecast vs Reality\n")
+	b.WriteString("\n  Forecast vs Reality [Delta = Forecast − Reality]\n")
 	if r.Comparison.Available {
 		fmt.Fprintf(&b, "    Delta       : %s (%s)\n",
 			r.Comparison.DeltaDisplay, r.Comparison.Narrative)
