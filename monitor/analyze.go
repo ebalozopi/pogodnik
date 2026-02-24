@@ -33,7 +33,7 @@ const (
 
 func tempSign(v float64) string {
 	if v < 0 {
-		return "" // negative sign is already included by %f
+		return "" // negative sign already included by %f
 	}
 	return "+"
 }
@@ -48,8 +48,8 @@ func FormatTemp(c float64) string {
 		tempSign(c), c, tempSign(f), f)
 }
 
-// FormatTempWithPrecision renders a temperature and appends a tilde (~)
-// prefix when the reading is NOT from a T-Group (integer-only precision).
+// FormatTempWithPrecision renders a temperature and prepends a tilde (~)
+// when the reading is NOT from a T-Group (integer-only precision).
 //
 //	IsPrecise=true  → "+12.3°C / +54.1°F"
 //	IsPrecise=false → "~+12.0°C / ~+54.0°F"
@@ -68,17 +68,17 @@ func FormatTempWithPrecision(c float64, isPrecise bool) string {
 
 // FormatDelta renders a delta value with an explicit sign.
 //
-// Strict formula: Delta = Forecast − Reality
+// Formula: Delta = Reality − Forecast
 //
-//	Positive → forecast was warmer than reality (warm bias)
-//	Negative → forecast was cooler than reality (cool bias)
+//	Positive → reality is warmer than forecast
+//	Negative → reality is cooler than forecast
 func FormatDelta(deltaC float64) string {
 	deltaF := deltaC * 9.0 / 5.0
 	return fmt.Sprintf("%+.1f°C / %+.1f°F", deltaC, deltaF)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Delta classification
+// Delta classification & verdict
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ClassifyDelta returns a human-readable accuracy label based on |delta|.
@@ -96,20 +96,35 @@ func ClassifyDelta(delta float64) string {
 	}
 }
 
-// BiasNarrative returns the bias direction as a short label.
+// DeltaVerdict returns a directional label for the delta.
 //
-//	delta > 0  → "warm bias"  (forecast was too warm)
-//	delta < 0  → "cool bias"  (forecast was too cool)
-//	delta ≈ 0  → "neutral"
-func BiasNarrative(delta float64) string {
+// Formula: Delta = Reality − Forecast
+//
+//	delta > 0  → "Warmer"   (reality warmer than predicted)
+//	delta < 0  → "Colder"   (reality colder than predicted)
+//	delta ≈ 0  → "Accurate" (forecast matched reality)
+func DeltaVerdict(delta float64) string {
 	switch {
 	case delta > 0.05:
-		return "warm bias"
+		return "Warmer"
 	case delta < -0.05:
-		return "cool bias"
+		return "Colder"
 	default:
-		return "neutral"
+		return "Accurate"
 	}
+}
+
+// FormatVerdict builds the full verdict string for display.
+//
+//	"+1.5°C (Warmer)"
+//	"-2.0°C (Colder)"
+//	"Accurate"
+func FormatVerdict(deltaC float64) string {
+	verdict := DeltaVerdict(deltaC)
+	if verdict == "Accurate" {
+		return "Accurate"
+	}
+	return fmt.Sprintf("%+.1f°C (%s)", deltaC, verdict)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -135,13 +150,17 @@ type ForecastReport struct {
 }
 
 // ComparisonReport holds the delta analysis.
-// Delta = Forecast − Reality (strict formula).
+//
+// Delta = Reality − Forecast (strict formula).
+//
+//	Positive → reality is warmer than forecast
+//	Negative → reality is cooler than forecast
 type ComparisonReport struct {
 	Available    bool
 	DeltaC       float64
 	DeltaF       float64
-	DeltaDisplay string // always shows sign: "+1.2°C / +2.2°F"
-	Narrative    string // "warm bias", "cool bias", "neutral"
+	DeltaDisplay string // always shows sign: "+1.5°C / +2.7°F"
+	Verdict      string // "Warmer", "Colder", "Accurate"
 	Accuracy     string // "Excellent", "Good", "Off", "Poor"
 }
 
@@ -192,10 +211,11 @@ type Report struct {
 // AnalyzeWeather constructs a full Report from an observation, optional
 // forecast, state snapshot, and pressure tracker.
 //
-// Delta formula: Forecast.Temp − Reality.Temp
+// Delta formula: Reality − Forecast
 //
-//	+2.0 means forecast predicted warmer than actual (warm bias)
-//	-2.0 means forecast predicted cooler than actual (cool bias)
+//	Reality +3.0, Forecast +1.5 → Delta = +1.5 (Warmer)
+//	Reality +10.0, Forecast +12.0 → Delta = -2.0 (Colder)
+//	Reality +15.0, Forecast +15.0 → Delta =  0.0 (Accurate)
 func AnalyzeWeather(
 	apt Airport,
 	obs *Observation,
@@ -237,15 +257,15 @@ func AnalyzeWeather(
 			ValidTime:   fc.Time,
 		}
 
-		// *** STRICT FORMULA: Delta = Forecast − Reality ***
-		deltaC := fc.TempCelsius - obs.TempCelsius
+		// *** STRICT FORMULA: Delta = Reality − Forecast ***
+		deltaC := obs.TempCelsius - fc.TempCelsius
 
 		r.Comparison = ComparisonReport{
 			Available:    true,
 			DeltaC:       deltaC,
 			DeltaF:       deltaC * 9.0 / 5.0,
 			DeltaDisplay: FormatDelta(deltaC),
-			Narrative:    BiasNarrative(deltaC),
+			Verdict:      DeltaVerdict(deltaC),
 			Accuracy:     ClassifyDelta(deltaC),
 		}
 	}
@@ -255,7 +275,7 @@ func AnalyzeWeather(
 	r.Extremes = ExtremesReport{
 		HighC:       state.DailyHigh,
 		HighDisplay: FormatTemp(state.DailyHigh),
-		LowC:       state.DailyLow,
+		LowC:        state.DailyLow,
 		LowDisplay:  FormatTemp(state.DailyLow),
 		TrackingDay: state.TrackingDay,
 		DayDisplay: fmt.Sprintf("%s (%s)",
@@ -300,8 +320,6 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 	var warnings []SensorWarning
 
 	// ── 1. Solar Heating Bias ───────────────────────────────────────────
-	// High direct radiation + low wind = sensor housing absorbs heat.
-	// Typical bias: +1 to +3 °C above true air temperature.
 	if ext != nil {
 		windMS := KnotsToMS(obs.WindSpeed)
 
@@ -325,8 +343,6 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 	}
 
 	// ── 2. Evaporative (Wet Bulb) Cooling ───────────────────────────────
-	// Rain/showers + relatively low humidity = evaporation cools the
-	// sensor below true air temperature. Typical bias: -0.5 to -1.5 °C.
 	if hasRainOrShowers(obs.PresentWeather) {
 		humidity := float64(0)
 		if ext != nil {
@@ -354,7 +370,6 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 	}
 
 	// ── 3. Sensor Icing ─────────────────────────────────────────────────
-	// Temp near 0°C + high humidity = moisture freezes on the sensor.
 	{
 		humidity := float64(0)
 		if ext != nil {
@@ -385,8 +400,6 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 	}
 
 	// ── 4. Infrared Radiation Cooling ───────────────────────────────────
-	// Clear night + calm wind = sensor radiates heat faster than
-	// surrounding air, reading slightly colder.
 	if ext != nil {
 		windMS := KnotsToMS(obs.WindSpeed)
 		isNight := ext.DirectRadiation == 0
@@ -462,10 +475,10 @@ func (r *Report) String() string {
 		b.WriteString("    (not available)\n")
 	}
 
-	b.WriteString("\n  Forecast vs Reality [Delta = Forecast − Reality]\n")
+	b.WriteString("\n  Forecast vs Reality [Delta = Reality − Forecast]\n")
 	if r.Comparison.Available {
-		fmt.Fprintf(&b, "    Delta       : %s (%s)\n",
-			r.Comparison.DeltaDisplay, r.Comparison.Narrative)
+		fmt.Fprintf(&b, "    Verdict     : %s\n", FormatVerdict(r.Comparison.DeltaC))
+		fmt.Fprintf(&b, "    Delta       : %s\n", r.Comparison.DeltaDisplay)
 		fmt.Fprintf(&b, "    Accuracy    : %s\n", r.Comparison.Accuracy)
 	} else {
 		b.WriteString("    (no forecast to compare)\n")
