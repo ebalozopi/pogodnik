@@ -28,6 +28,22 @@ const (
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Delta calculation — single source of truth
+// ═══════════════════════════════════════════════════════════════════════════
+
+// CalculateDelta computes Delta = Reality − Forecast.
+//
+// This is the ONLY place where delta is calculated. Every caller
+// (engine.go, main.go, tests) must use this function.
+//
+//	Reality +3.0, Forecast +1.5 → +1.5 (reality is warmer)
+//	Reality +10.0, Forecast +12.0 → -2.0 (reality is colder)
+//	Reality +15.0, Forecast +15.0 →  0.0 (accurate)
+func CalculateDelta(reality, forecast float64) float64 {
+	return reality - forecast
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Temperature formatting — precision-aware
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -82,6 +98,11 @@ func FormatDelta(deltaC float64) string {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ClassifyDelta returns a human-readable accuracy label based on |delta|.
+//
+//	|Δ| < 0.5  → Excellent
+//	|Δ| < 1.0  → Good
+//	|Δ| < 2.0  → Off
+//	|Δ| >= 2.0 → Poor
 func ClassifyDelta(delta float64) string {
 	ad := math.Abs(delta)
 	switch {
@@ -100,9 +121,9 @@ func ClassifyDelta(delta float64) string {
 //
 // Formula: Delta = Reality − Forecast
 //
-//	delta > 0  → "Warmer"   (reality warmer than predicted)
-//	delta < 0  → "Colder"   (reality colder than predicted)
-//	delta ≈ 0  → "Accurate" (forecast matched reality)
+//	delta > +0.05  → "Warmer"   (reality warmer than predicted)
+//	delta < -0.05  → "Colder"   (reality colder than predicted)
+//	|delta| <= 0.05 → "Accurate" (forecast matched reality)
 func DeltaVerdict(delta float64) string {
 	switch {
 	case delta > 0.05:
@@ -258,7 +279,7 @@ func AnalyzeWeather(
 		}
 
 		// *** STRICT FORMULA: Delta = Reality − Forecast ***
-		deltaC := obs.TempCelsius - fc.TempCelsius
+		deltaC := CalculateDelta(obs.TempCelsius, fc.TempCelsius)
 
 		r.Comparison = ComparisonReport{
 			Available:    true,
@@ -275,7 +296,7 @@ func AnalyzeWeather(
 	r.Extremes = ExtremesReport{
 		HighC:       state.DailyHigh,
 		HighDisplay: FormatTemp(state.DailyHigh),
-		LowC:        state.DailyLow,
+		LowC:       state.DailyLow,
 		LowDisplay:  FormatTemp(state.DailyLow),
 		TrackingDay: state.TrackingDay,
 		DayDisplay: fmt.Sprintf("%s (%s)",
@@ -320,6 +341,8 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 	var warnings []SensorWarning
 
 	// ── 1. Solar Heating Bias ───────────────────────────────────────────
+	// High direct radiation + low wind = sensor housing absorbs heat.
+	// Typical bias: +1 to +3 °C above true air temperature.
 	if ext != nil {
 		windMS := KnotsToMS(obs.WindSpeed)
 
@@ -343,6 +366,8 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 	}
 
 	// ── 2. Evaporative (Wet Bulb) Cooling ───────────────────────────────
+	// Rain/showers + relatively low humidity = evaporation cools the
+	// sensor below true air temperature. Typical bias: -0.5 to -1.5 °C.
 	if hasRainOrShowers(obs.PresentWeather) {
 		humidity := float64(0)
 		if ext != nil {
@@ -370,6 +395,8 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 	}
 
 	// ── 3. Sensor Icing ─────────────────────────────────────────────────
+	// Temp near 0°C + high humidity = moisture freezes on the sensor,
+	// insulating it and causing it to read stale/incorrect values.
 	{
 		humidity := float64(0)
 		if ext != nil {
@@ -400,6 +427,8 @@ func CheckSensorBias(obs *Observation, ext *HourlyExtended) []SensorWarning {
 	}
 
 	// ── 4. Infrared Radiation Cooling ───────────────────────────────────
+	// Clear night + calm wind = sensor radiates heat to sky faster than
+	// surrounding air, reading slightly colder.
 	if ext != nil {
 		windMS := KnotsToMS(obs.WindSpeed)
 		isNight := ext.DirectRadiation == 0
@@ -447,7 +476,7 @@ func formatWindForReport(obs *Observation) string {
 
 func (r *Report) String() string {
 	var b strings.Builder
-	b.Grow(1400)
+	b.Grow(1600)
 
 	divider := "═══════════════════════════════════════════════════════════"
 
@@ -459,6 +488,8 @@ func (r *Report) String() string {
 	b.WriteString(divider)
 	b.WriteByte('\n')
 
+	// ── Observation ─────────────────────────────────────────────────────
+
 	b.WriteString("\n  Observation (METAR)\n")
 	precLabel := "T-Group 0.1°C"
 	if !r.Observation.IsPrecise {
@@ -468,12 +499,16 @@ func (r *Report) String() string {
 	fmt.Fprintf(&b, "    Wind        : %s\n", r.Observation.Wind)
 	fmt.Fprintf(&b, "    Visibility  : %s\n", r.Observation.Visibility)
 
+	// ── Forecast ────────────────────────────────────────────────────────
+
 	b.WriteString("\n  Forecast (Open-Meteo)\n")
 	if r.Forecast.Available {
 		fmt.Fprintf(&b, "    Temperature : %s\n", r.Forecast.TempDisplay)
 	} else {
 		b.WriteString("    (not available)\n")
 	}
+
+	// ── Comparison [Delta = Reality − Forecast] ─────────────────────────
 
 	b.WriteString("\n  Forecast vs Reality [Delta = Reality − Forecast]\n")
 	if r.Comparison.Available {
@@ -484,6 +519,8 @@ func (r *Report) String() string {
 		b.WriteString("    (no forecast to compare)\n")
 	}
 
+	// ── Daily Extremes ──────────────────────────────────────────────────
+
 	fmt.Fprintf(&b, "\n  Daily Extremes — %s\n", r.Extremes.DayDisplay)
 	if math.IsInf(r.Extremes.HighC, 0) {
 		b.WriteString("    (awaiting first observation)\n")
@@ -492,12 +529,16 @@ func (r *Report) String() string {
 		fmt.Fprintf(&b, "    Low  (ATL)  : %s\n", r.Extremes.LowDisplay)
 	}
 
+	// ── Pressure ────────────────────────────────────────────────────────
+
 	b.WriteString("\n  Pressure\n")
 	if r.Pressure.Available {
 		fmt.Fprintf(&b, "    %s\n", r.Pressure.Display)
 	} else {
 		b.WriteString("    (no pressure data)\n")
 	}
+
+	// ── Sensor QA ───────────────────────────────────────────────────────
 
 	if len(r.SensorWarnings) > 0 {
 		b.WriteString("\n  ⚠️  Sensor QA\n")
