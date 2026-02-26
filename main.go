@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -28,7 +27,6 @@ import (
 const (
 	defaultPollSeconds = 300 // 5 minutes — respects Open-Meteo 10k/day limit
 	defaultDBPath      = "pogodnik.db"
-	defaultThreshold   = 0.5
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -268,7 +266,6 @@ func (app *App) registerHandlers() {
 			return c.Send("Usage: /del ICAO\nExample: /del UUEE")
 		}
 
-		// Check if airport exists first.
 		apt, err := storage.GetAirport(app.db, icao)
 		if err != nil || apt == nil {
 			return c.Send(fmt.Sprintf("🤷‍♂️ Airport %s not found in monitoring list.", icao))
@@ -276,12 +273,10 @@ func (app *App) registerHandlers() {
 
 		city := apt.City
 
-		// Delete associated weather logs first (cascade may not work in all SQLite builds).
 		if err := app.db.Where("airport_icao = ?", icao).Delete(&storage.WeatherLog{}).Error; err != nil {
 			log.Printf("[del] failed to delete logs for %s: %v", icao, err)
 		}
 
-		// Delete the airport record.
 		if err := app.db.Where("icao = ?", icao).Delete(&storage.Airport{}).Error; err != nil {
 			return c.Send(fmt.Sprintf("❌ Failed to delete %s: %v", icao, err))
 		}
@@ -388,23 +383,31 @@ func (app *App) registerHandlers() {
 
 		monitorApt := dbToMonitorAirport(*apt)
 
+		// ── Fetch METAR from NOAA ───────────────────────────────────────
+
 		obs, err := monitor.FetchMETAR(ctx, apt.ICAO)
 		if err != nil {
 			return c.Send(fmt.Sprintf("❌ METAR fetch failed: %v", err))
 		}
 
+		// ── Fetch forecast from Open-Meteo ──────────────────────────────
+
 		fc, _ := monitor.FetchForecast(ctx, monitorApt)
+
+		// ── Delta = Reality − Forecast ──────────────────────────────────
 
 		var forecastTemp, delta float64
 		var condition string
 
 		if fc != nil {
 			forecastTemp = fc.TempCelsius
-			delta = obs.TempCelsius - fc.TempCelsius
-			condition = classifyDelta(delta)
+			delta = monitor.CalculateDelta(obs.TempCelsius, fc.TempCelsius)
+			condition = monitor.ClassifyDelta(delta)
 		} else {
 			condition = "NoForecast"
 		}
+
+		// ── Save to DB ──────────────────────────────────────────────────
 
 		wlog := &storage.WeatherLog{
 			AirportICAO:  apt.ICAO,
@@ -413,8 +416,13 @@ func (app *App) registerHandlers() {
 			RealTemp:     obs.TempCelsius,
 			Delta:        delta,
 			Condition:    condition,
+			IsSpeci:      obs.IsSpeci,
+			WindSpeed:    monitor.KnotsToMS(obs.WindSpeed),
+			RawMETAR:     obs.Raw,
 		}
 		_ = storage.InsertWeatherLog(app.db, wlog)
+
+		// ── Build and send report ───────────────────────────────────────
 
 		msg := formatCheckReport(apt, obs, fc, delta, condition)
 
@@ -426,11 +434,8 @@ func (app *App) registerHandlers() {
 	app.bot.Handle("/export", func(c tele.Context) error {
 		_ = c.Send("📊 Generating report…")
 
-		var logs []storage.WeatherLog
-		err := app.db.
-			Order("timestamp DESC").
-			Limit(5000).
-			Find(&logs).Error
+		// Fetch ALL logs for the last 30 days — no row limit.
+		logs, err := storage.Last30DaysLogs(app.db)
 		if err != nil {
 			return c.Send(fmt.Sprintf("❌ Database error: %v", err))
 		}
@@ -457,7 +462,7 @@ func (app *App) registerHandlers() {
 		doc := &tele.Document{
 			File:     tele.FromReader(buf),
 			FileName: fileName,
-			Caption:  fmt.Sprintf("📊 Weather report — %d records", len(logs)),
+			Caption:  fmt.Sprintf("📊 Weather report — %d records (30 days)", len(logs)),
 		}
 
 		return c.Send(doc)
@@ -483,8 +488,12 @@ func (app *App) registerHandlers() {
 		}
 
 		// Estimate daily API calls.
+		// With event-driven logging, actual DB writes are ~24-48 per airport/day.
+		// API calls still happen every poll interval for METAR check.
 		pollsPerDay := 86400 / int(app.cfg.PollInterval.Seconds())
-		apiCallsPerDay := pollsPerDay * len(airports) * 2 // METAR + forecast
+		metarCallsPerDay := pollsPerDay * len(airports)
+		// Forecast is cached for 3h, so ~8 calls/day per airport max.
+		forecastCallsPerDay := 8 * len(airports)
 
 		status := fmt.Sprintf(`📊 *Pogodnik Status*
 
@@ -492,18 +501,118 @@ func (app *App) registerHandlers() {
 • Total logs: %d
 • Logs (last hour): %d
 • Poll interval: %s
-• Est. API calls/day: ~%d
-• Database: %s`,
+• Est. METAR checks/day: ~%d
+• Est. forecast API/day: ~%d
+• Database: %s
+• Logging: event-driven (on METAR change only)`,
 			len(airports), muted,
 			totalLogs,
 			recentCount,
 			app.cfg.PollInterval,
-			apiCallsPerDay,
+			metarCallsPerDay,
+			forecastCallsPerDay,
 			app.cfg.DBPath,
 		)
 
 		return c.Send(status, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 	})
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// /check report builder
+// ═══════════════════════════════════════════════════════════════════════════
+
+func formatCheckReport(
+	apt *storage.Airport,
+	obs *monitor.Observation,
+	fc *monitor.HourlyForecast,
+	delta float64,
+	condition string,
+) string {
+	var b strings.Builder
+	b.Grow(1000)
+
+	loc, err := time.LoadLocation(apt.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	localNow := time.Now().In(loc)
+
+	// ── Header ──────────────────────────────────────────────────────────
+
+	if obs.IsSpeci {
+		b.WriteString("⚡️ *SPECI*\n")
+	}
+	b.WriteString(fmt.Sprintf("🛫 *%s (%s)*\n", apt.City, apt.ICAO))
+	b.WriteString(fmt.Sprintf("🕐 %s\n\n", localNow.Format("Mon, 02 Jan 2006 15:04 MST")))
+
+	// ── Current Conditions ──────────────────────────────────────────────
+
+	precLabel := ""
+	if !obs.IsPrecise {
+		precLabel = " [±1°C]"
+	}
+
+	b.WriteString("📡 *Current Conditions*\n```\n")
+	b.WriteString(fmt.Sprintf("Temperature : %s%s\n",
+		monitor.FormatTempWithPrecision(obs.TempCelsius, obs.IsPrecise), precLabel))
+
+	if obs.WindSpeed == 0 && obs.WindGust == 0 {
+		b.WriteString("Wind        : Calm\n")
+	} else {
+		dir := "VRB"
+		if obs.WindDir >= 0 {
+			dir = fmt.Sprintf("%03d°", obs.WindDir)
+		}
+		wind := fmt.Sprintf("%s @ %dkt (%.1f m/s)", dir, obs.WindSpeed,
+			monitor.KnotsToMS(obs.WindSpeed))
+		if obs.WindGust > 0 {
+			wind += fmt.Sprintf(", gusting %dkt", obs.WindGust)
+		}
+		b.WriteString(fmt.Sprintf("Wind        : %s\n", wind))
+	}
+
+	b.WriteString(fmt.Sprintf("Visibility  : %s\n", obs.Visibility))
+
+	if len(obs.PresentWeather) > 0 {
+		b.WriteString(fmt.Sprintf("Weather     : %s\n",
+			strings.Join(obs.PresentWeather, " ")))
+	}
+
+	if obs.HasPressure {
+		b.WriteString(fmt.Sprintf("Pressure    : %.1f hPa\n", obs.PressureHpa))
+	}
+
+	if obs.IsSpeci {
+		b.WriteString("⚡ Type       : SPECI (Special Obs)\n")
+	}
+
+	b.WriteString("```\n\n")
+
+	// ── Forecast vs Reality ─────────────────────────────────────────────
+	//
+	// Delta = Reality − Forecast
+	//   + means reality warmer
+	//   - means reality colder
+
+	if fc != nil {
+		b.WriteString("🎯 *Forecast vs Reality*\n```\n")
+		b.WriteString(fmt.Sprintf("Forecast    : %s\n", monitor.FormatTemp(fc.TempCelsius)))
+		b.WriteString(fmt.Sprintf("Reality     : %s\n",
+			monitor.FormatTempWithPrecision(obs.TempCelsius, obs.IsPrecise)))
+		b.WriteString(fmt.Sprintf("Delta       : %s\n", monitor.FormatDelta(delta)))
+		b.WriteString(fmt.Sprintf("Verdict     : %s\n", monitor.FormatVerdict(delta)))
+		b.WriteString(fmt.Sprintf("Accuracy    : %s\n", condition))
+		b.WriteString("```\n")
+	} else {
+		b.WriteString("_Forecast not available_\n")
+	}
+
+	// ── Raw METAR ───────────────────────────────────────────────────────
+
+	b.WriteString(fmt.Sprintf("\n📋 `%s`", obs.Raw))
+
+	return b.String()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -531,75 +640,6 @@ func dbToMonitorAirport(a storage.Airport) monitor.Airport {
 		Longitude: a.Lon,
 		Timezone:  a.Timezone,
 	}
-}
-
-func classifyDelta(delta float64) string {
-	abs := math.Abs(delta)
-	switch {
-	case abs < 1.0:
-		return "Accurate"
-	case abs < 2.5:
-		return "Close"
-	case abs < 5.0:
-		return "Off"
-	default:
-		return "Poor"
-	}
-}
-
-func formatCheckReport(
-	apt *storage.Airport,
-	obs *monitor.Observation,
-	fc *monitor.HourlyForecast,
-	delta float64,
-	condition string,
-) string {
-	var b strings.Builder
-	b.Grow(800)
-
-	loc, err := time.LoadLocation(apt.Timezone)
-	if err != nil {
-		loc = time.UTC
-	}
-	localNow := time.Now().In(loc)
-
-	b.WriteString(fmt.Sprintf("🛫 *%s (%s)*\n", apt.City, apt.ICAO))
-	b.WriteString(fmt.Sprintf("🕐 %s\n\n", localNow.Format("Mon, 02 Jan 2006 15:04 MST")))
-
-	b.WriteString("📡 *Current Conditions*\n```\n")
-	b.WriteString(fmt.Sprintf("Temperature : %s\n", monitor.FormatTemp(obs.TempCelsius)))
-
-	if obs.WindSpeed == 0 && obs.WindGust == 0 {
-		b.WriteString("Wind        : Calm\n")
-	} else {
-		dir := "VRB"
-		if obs.WindDir >= 0 {
-			dir = fmt.Sprintf("%03d°", obs.WindDir)
-		}
-		wind := fmt.Sprintf("%s @ %dkt", dir, obs.WindSpeed)
-		if obs.WindGust > 0 {
-			wind += fmt.Sprintf(", gusting %dkt", obs.WindGust)
-		}
-		b.WriteString(fmt.Sprintf("Wind        : %s\n", wind))
-	}
-
-	b.WriteString(fmt.Sprintf("Visibility  : %s\n", obs.Visibility))
-	b.WriteString("```\n\n")
-
-	if fc != nil {
-		b.WriteString("🎯 *Forecast vs Reality*\n```\n")
-		b.WriteString(fmt.Sprintf("Forecast    : %s\n", monitor.FormatTemp(fc.TempCelsius)))
-		b.WriteString(fmt.Sprintf("Reality     : %s\n", monitor.FormatTemp(obs.TempCelsius)))
-		b.WriteString(fmt.Sprintf("Delta       : %s\n", monitor.FormatDelta(delta)))
-		b.WriteString(fmt.Sprintf("Verdict     : %s\n", condition))
-		b.WriteString("```\n")
-	} else {
-		b.WriteString("_Forecast not available_\n")
-	}
-
-	b.WriteString(fmt.Sprintf("\n📋 `%s`", obs.Raw))
-
-	return b.String()
 }
 
 func escapeMarkdownV2(s string) string {
