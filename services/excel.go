@@ -3,6 +3,7 @@ package services
 import (
 	"fmt"
 	"math"
+	"sort"
 
 	"pogodnik/storage"
 
@@ -11,6 +12,9 @@ import (
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GenerateReport — multi-sheet Excel with bias analytics
+//
+// Expects ALL logs for the reporting window (typically 30 days).
+// The caller must NOT apply any row limits.
 // ═══════════════════════════════════════════════════════════════════════════
 
 func GenerateReport(logs []storage.WeatherLog) (*excelize.File, error) {
@@ -63,8 +67,10 @@ func createStyles(f *excelize.File) (*reportStyles, error) {
 	s.header, err = f.NewStyle(&excelize.Style{
 		Font: &excelize.Font{Bold: true, Size: 11, Color: "#FFFFFF"},
 		Fill: excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"#2B5797"}},
-		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center", WrapText: true},
-		Border:    []excelize.Border{{Type: "bottom", Color: "#000000", Style: 2}},
+		Alignment: &excelize.Alignment{
+			Horizontal: "center", Vertical: "center", WrapText: true,
+		},
+		Border: []excelize.Border{{Type: "bottom", Color: "#000000", Style: 2}},
 	})
 	if err != nil {
 		return nil, err
@@ -148,13 +154,12 @@ func createStyles(f *excelize.File) (*reportStyles, error) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Sheet 1: Raw Data (30 Days)
+// Sheet 1: Raw Data (all logs, no limit)
 // ═══════════════════════════════════════════════════════════════════════════
 
 func writeRawDataSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog) error {
 	sheet := "Raw Data (30 Days)"
-	_, err := f.NewSheet(sheet)
-	if err != nil {
+	if _, err := f.NewSheet(sheet); err != nil {
 		return err
 	}
 
@@ -165,11 +170,10 @@ func writeRawDataSheet(f *excelize.File, s *reportStyles, logs []storage.Weather
 		"Wind (m/s)", "Solar (W/m²)",
 		"Rain", "Fog", "SPECI",
 	}
-
 	widths := []float64{12, 10, 8, 14, 14, 12, 10, 12, 12, 14, 6, 6, 6}
 
 	for i, h := range headers {
-		c, _ := excelize.CoordinatesToCellName(i+1, 1)
+		c := cell(i+1, 1)
 		_ = f.SetCellValue(sheet, c, h)
 		_ = f.SetCellStyle(sheet, c, c, s.header)
 	}
@@ -185,29 +189,31 @@ func writeRawDataSheet(f *excelize.File, s *reportStyles, logs []storage.Weather
 		verdict := classifyAbsDelta(ad)
 
 		vals := []interface{}{
-			l.Timestamp.UTC().Format("2006-01-02"),
-			l.Timestamp.UTC().Format("15:04:05"),
-			l.AirportICAO,
-			l.ForecastTemp,
-			l.RealTemp,
-			l.Delta,
-			ad,
-			verdict,
-			l.WindSpeed,
-			l.DirectRadiation,
-			boolStr(l.IsRaining),
-			boolStr(l.IsFoggy),
-			boolStr(l.IsSpeci),
+			l.Timestamp.UTC().Format("2006-01-02"),  // Date
+			l.Timestamp.UTC().Format("15:04:05"),    // Time
+			l.AirportICAO,                           // Airport
+			l.ForecastTemp,                          // Forecast
+			l.RealTemp,                              // Reality
+			l.Delta,                                 // Delta (Reality − Forecast)
+			ad,                                      // |Delta|
+			verdict,                                 // Verdict
+			l.WindSpeed,                             // Wind m/s
+			l.DirectRadiation,                       // Solar W/m²
+			boolStr(l.IsRaining),                    // Rain
+			boolStr(l.IsFoggy),                      // Fog
+			boolStr(l.IsSpeci),                      // SPECI
 		}
 
 		for col, v := range vals {
-			c, _ := excelize.CoordinatesToCellName(col+1, row)
+			c := cell(col+1, row)
 			_ = f.SetCellValue(sheet, c, v)
 
+			// Number formatting for numeric columns.
 			if col >= 3 && col <= 6 || col == 8 || col == 9 {
 				_ = f.SetCellStyle(sheet, c, c, s.number)
 			}
 
+			// Boolean formatting.
 			if col >= 10 && col <= 12 {
 				if v == "YES" {
 					_ = f.SetCellStyle(sheet, c, c, s.boolTrue)
@@ -217,9 +223,10 @@ func writeRawDataSheet(f *excelize.File, s *reportStyles, logs []storage.Weather
 			}
 		}
 
+		// Highlight entire row red when |delta| > 1.0.
 		if ad > 1.0 {
 			for col := 0; col < len(vals); col++ {
-				c, _ := excelize.CoordinatesToCellName(col+1, row)
+				c := cell(col+1, row)
 				_ = f.SetCellStyle(sheet, c, c, s.red)
 			}
 		}
@@ -233,16 +240,16 @@ func writeRawDataSheet(f *excelize.File, s *reportStyles, logs []storage.Weather
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Sheet 2: Bias Analysis
+// Sheet 2: Bias Analysis (per airport)
 // ═══════════════════════════════════════════════════════════════════════════
 
 func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog) error {
 	sheet := "Bias Analysis"
-	_, err := f.NewSheet(sheet)
-	if err != nil {
+	if _, err := f.NewSheet(sheet); err != nil {
 		return err
 	}
 
+	// Group logs by airport, preserving encounter order.
 	byAirport := make(map[string][]storage.WeatherLog)
 	var icaoOrder []string
 
@@ -267,11 +274,10 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 		"Rain N",
 		"Assessment",
 	}
-
 	widths := []float64{10, 14, 14, 14, 14, 14, 14, 14, 10, 14, 10, 16}
 
 	for i, h := range headers {
-		c, _ := excelize.CoordinatesToCellName(i+1, 1)
+		c := cell(i+1, 1)
 		_ = f.SetCellValue(sheet, c, h)
 		_ = f.SetCellStyle(sheet, c, c, s.header)
 	}
@@ -301,7 +307,7 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 		}
 
 		for col, v := range vals {
-			c, _ := excelize.CoordinatesToCellName(col+1, row)
+			c := cell(col+1, row)
 			_ = f.SetCellValue(sheet, c, v)
 
 			switch col {
@@ -312,7 +318,8 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 			}
 		}
 
-		assessCell, _ := excelize.CoordinatesToCellName(12, row)
+		// Colour-code assessment.
+		assessCell := cell(12, row)
 		switch assessment {
 		case "EXCELLENT":
 			_ = f.SetCellStyle(sheet, assessCell, assessCell, s.green)
@@ -322,21 +329,25 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 			_ = f.SetCellStyle(sheet, assessCell, assessCell, s.red)
 		}
 
-		biasCell, _ := excelize.CoordinatesToCellName(3, row)
-		if math.Abs(stats.AvgBias) > 1.0 {
+		// Colour-code bias magnitude.
+		biasCell := cell(3, row)
+		switch ab := math.Abs(stats.AvgBias); {
+		case ab > 1.0:
 			_ = f.SetCellStyle(sheet, biasCell, biasCell, s.red)
-		} else if math.Abs(stats.AvgBias) > 0.5 {
+		case ab > 0.5:
 			_ = f.SetCellStyle(sheet, biasCell, biasCell, s.yellow)
-		} else {
+		default:
 			_ = f.SetCellStyle(sheet, biasCell, biasCell, s.green)
 		}
 
 		row++
 	}
 
+	// ── Legend ───────────────────────────────────────────────────────────
+
 	legendRow := row + 2
 	legends := []struct{ label, desc string }{
-		{"Avg Bias", "Mean(Forecast − Reality). Positive = Warm Bias in forecast."},
+		{"Avg Bias", "Mean(Reality − Forecast). Positive = Reality warmer than forecast."},
 		{"Excellent", "% of observations within ±0.5°C."},
 		{"Good", "% of observations within ±1.0°C."},
 		{"Critical", "% of observations with |error| > 1.0°C."},
@@ -363,30 +374,33 @@ func writeBiasSheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Sheet 3: Daily Summary
+// Sheet 3: Daily Summary (grouped by Date + Airport)
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// Each row = one airport on one day.
+// Columns: Date | Airport | Avg Delta | ATH | ATL | Range (ATH−ATL) | Log Count
 
 func writeDailySheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLog) error {
 	sheet := "Daily Summary"
-	_, err := f.NewSheet(sheet)
-	if err != nil {
+	if _, err := f.NewSheet(sheet); err != nil {
 		return err
 	}
 
-	summaries := storage.ComputeDailySummaries(logs)
+	summaries := computeDailyAirportSummaries(logs)
 
 	headers := []string{
 		"Date",
-		"Observations",
-		"Avg |Error| (°C)",
-		"Max |Error| (°C)",
-		"Avg Bias (°C)",
-		"Quality",
+		"Airport",
+		"Avg Delta (°C)",
+		"ATH (°C)",
+		"ATL (°C)",
+		"Range (ATH−ATL)",
+		"Log Count",
 	}
-	widths := []float64{14, 14, 16, 16, 14, 14}
+	widths := []float64{14, 10, 16, 12, 12, 16, 12}
 
 	for i, h := range headers {
-		c, _ := excelize.CoordinatesToCellName(i+1, 1)
+		c := cell(i+1, 1)
 		_ = f.SetCellValue(sheet, c, h)
 		_ = f.SetCellStyle(sheet, c, c, s.header)
 	}
@@ -395,72 +409,134 @@ func writeDailySheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLo
 		_ = f.SetColWidth(sheet, col, col, w)
 	}
 
+	// Track previous date to add visual separation via alternating styling.
+	prevDate := ""
+
 	for rowIdx, ds := range summaries {
 		row := rowIdx + 2
-		quality := dailyQuality(ds.AvgAbsError)
 
 		vals := []interface{}{
 			ds.Date,
+			ds.ICAO,
+			ds.AvgDelta,
+			ds.ATH,
+			ds.ATL,
+			ds.DiurnalRange,
 			ds.Count,
-			ds.AvgAbsError,
-			ds.MaxAbsError,
-			ds.AvgBias,
-			quality,
 		}
 
 		for col, v := range vals {
-			c, _ := excelize.CoordinatesToCellName(col+1, row)
+			c := cell(col+1, row)
 			_ = f.SetCellValue(sheet, c, v)
 
-			if col >= 2 && col <= 4 {
+			// Number formatting for temp columns.
+			if col >= 2 && col <= 5 {
 				_ = f.SetCellStyle(sheet, c, c, s.number)
 			}
 		}
 
-		qCell, _ := excelize.CoordinatesToCellName(6, row)
-		switch quality {
-		case "EXCELLENT":
-			_ = f.SetCellStyle(sheet, qCell, qCell, s.green)
-		case "GOOD":
-			_ = f.SetCellStyle(sheet, qCell, qCell, s.yellow)
+		// Colour-code Avg Delta.
+		deltaCell := cell(3, row)
+		switch ad := math.Abs(ds.AvgDelta); {
+		case ad > 1.0:
+			_ = f.SetCellStyle(sheet, deltaCell, deltaCell, s.red)
+		case ad > 0.5:
+			_ = f.SetCellStyle(sheet, deltaCell, deltaCell, s.yellow)
 		default:
-			_ = f.SetCellStyle(sheet, qCell, qCell, s.red)
+			_ = f.SetCellStyle(sheet, deltaCell, deltaCell, s.green)
 		}
 
-		if ds.AvgAbsError > 1.0 {
+		// Colour-code large diurnal range (>15°C is notable).
+		rangeCell := cell(6, row)
+		if ds.DiurnalRange > 15.0 {
+			_ = f.SetCellStyle(sheet, rangeCell, rangeCell, s.yellow)
+		}
+
+		// Highlight row red when avg |delta| > 1.0.
+		if math.Abs(ds.AvgDelta) > 1.0 {
 			for col := 0; col < len(vals); col++ {
-				c, _ := excelize.CoordinatesToCellName(col+1, row)
+				c := cell(col+1, row)
 				_ = f.SetCellStyle(sheet, c, c, s.red)
 			}
 		}
+
+		// Track date change for the aggregate footer.
+		if ds.Date != prevDate {
+			prevDate = ds.Date
+		}
 	}
+
+	// ── 30-day aggregate footer ─────────────────────────────────────────
 
 	if len(summaries) > 0 {
 		aggRow := len(summaries) + 3
 
-		var totalObs int
-		var totalAbsErr, totalBias, maxErr float64
+		// Collect unique airports for per-airport totals.
+		type airportAgg struct {
+			sumDelta float64
+			maxTemp  float64
+			minTemp  float64
+			count    int
+		}
+
+		byAirport := make(map[string]*airportAgg)
+		var airportOrder []string
 
 		for _, ds := range summaries {
-			totalObs += ds.Count
-			totalAbsErr += ds.AvgAbsError * float64(ds.Count)
-			totalBias += ds.AvgBias * float64(ds.Count)
-			if ds.MaxAbsError > maxErr {
-				maxErr = ds.MaxAbsError
+			aa, exists := byAirport[ds.ICAO]
+			if !exists {
+				aa = &airportAgg{
+					maxTemp: ds.ATH,
+					minTemp: ds.ATL,
+				}
+				byAirport[ds.ICAO] = aa
+				airportOrder = append(airportOrder, ds.ICAO)
+			}
+			aa.sumDelta += ds.AvgDelta * float64(ds.Count)
+			aa.count += ds.Count
+			if ds.ATH > aa.maxTemp {
+				aa.maxTemp = ds.ATH
+			}
+			if ds.ATL < aa.minTemp {
+				aa.minTemp = ds.ATL
 			}
 		}
 
-		n := float64(totalObs)
-
-		_ = f.SetCellValue(sheet, cell(1, aggRow), "30-DAY TOTAL")
+		_ = f.SetCellValue(sheet, cell(1, aggRow), "30-DAY TOTALS")
 		_ = f.SetCellStyle(sheet, cell(1, aggRow), cell(1, aggRow), s.bold)
-		_ = f.SetCellValue(sheet, cell(2, aggRow), totalObs)
-		_ = f.SetCellValue(sheet, cell(3, aggRow), totalAbsErr/n)
-		_ = f.SetCellStyle(sheet, cell(3, aggRow), cell(3, aggRow), s.number)
-		_ = f.SetCellValue(sheet, cell(4, aggRow), maxErr)
-		_ = f.SetCellStyle(sheet, cell(4, aggRow), cell(4, aggRow), s.number)
-		_ = f.SetCellValue(sheet, cell(5, aggRow), totalBias/n)
-		_ = f.SetCellStyle(sheet, cell(5, aggRow), cell(5, aggRow), s.number)
+		aggRow++
+
+		for _, icao := range airportOrder {
+			aa := byAirport[icao]
+			avgDelta := aa.sumDelta / float64(aa.count)
+			diurnal := aa.maxTemp - aa.minTemp
+
+			_ = f.SetCellValue(sheet, cell(1, aggRow), "TOTAL")
+			_ = f.SetCellStyle(sheet, cell(1, aggRow), cell(1, aggRow), s.bold)
+			_ = f.SetCellValue(sheet, cell(2, aggRow), icao)
+			_ = f.SetCellStyle(sheet, cell(2, aggRow), cell(2, aggRow), s.bold)
+			_ = f.SetCellValue(sheet, cell(3, aggRow), avgDelta)
+			_ = f.SetCellStyle(sheet, cell(3, aggRow), cell(3, aggRow), s.number)
+			_ = f.SetCellValue(sheet, cell(4, aggRow), aa.maxTemp)
+			_ = f.SetCellStyle(sheet, cell(4, aggRow), cell(4, aggRow), s.number)
+			_ = f.SetCellValue(sheet, cell(5, aggRow), aa.minTemp)
+			_ = f.SetCellStyle(sheet, cell(5, aggRow), cell(5, aggRow), s.number)
+			_ = f.SetCellValue(sheet, cell(6, aggRow), diurnal)
+			_ = f.SetCellStyle(sheet, cell(6, aggRow), cell(6, aggRow), s.number)
+			_ = f.SetCellValue(sheet, cell(7, aggRow), aa.count)
+
+			// Colour-code the aggregate delta.
+			switch ad := math.Abs(avgDelta); {
+			case ad > 1.0:
+				_ = f.SetCellStyle(sheet, cell(3, aggRow), cell(3, aggRow), s.red)
+			case ad > 0.5:
+				_ = f.SetCellStyle(sheet, cell(3, aggRow), cell(3, aggRow), s.yellow)
+			default:
+				_ = f.SetCellStyle(sheet, cell(3, aggRow), cell(3, aggRow), s.green)
+			}
+
+			aggRow++
+		}
 	}
 
 	_ = f.SetPanes(sheet, &excelize.Panes{
@@ -468,6 +544,90 @@ func writeDailySheet(f *excelize.File, s *reportStyles, logs []storage.WeatherLo
 	})
 
 	return nil
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Daily airport summary computation
+// ═══════════════════════════════════════════════════════════════════════════
+
+// dailyAirportSummary holds one airport's stats for one UTC day.
+type dailyAirportSummary struct {
+	Date         string
+	ICAO         string
+	AvgDelta     float64 // mean(Reality − Forecast)
+	ATH          float64 // max RealTemp that day
+	ATL          float64 // min RealTemp that day
+	DiurnalRange float64 // ATH − ATL
+	Count        int
+}
+
+// computeDailyAirportSummaries groups logs by (Date, ICAO) and calculates
+// per-group metrics. Results are sorted by date ascending then ICAO.
+func computeDailyAirportSummaries(logs []storage.WeatherLog) []dailyAirportSummary {
+	type groupKey struct {
+		date string
+		icao string
+	}
+
+	type accumulator struct {
+		sumDelta float64
+		maxTemp  float64
+		minTemp  float64
+		count    int
+	}
+
+	groups := make(map[groupKey]*accumulator)
+	var keyOrder []groupKey
+
+	for _, l := range logs {
+		day := l.Timestamp.UTC().Format("2006-01-02")
+		k := groupKey{date: day, icao: l.AirportICAO}
+
+		acc, exists := groups[k]
+		if !exists {
+			acc = &accumulator{
+				maxTemp: l.RealTemp,
+				minTemp: l.RealTemp,
+			}
+			groups[k] = acc
+			keyOrder = append(keyOrder, k)
+		}
+
+		acc.sumDelta += l.Delta
+		acc.count++
+
+		if l.RealTemp > acc.maxTemp {
+			acc.maxTemp = l.RealTemp
+		}
+		if l.RealTemp < acc.minTemp {
+			acc.minTemp = l.RealTemp
+		}
+	}
+
+	// Sort by date ascending, then by ICAO alphabetically.
+	sort.Slice(keyOrder, func(i, j int) bool {
+		if keyOrder[i].date != keyOrder[j].date {
+			return keyOrder[i].date < keyOrder[j].date
+		}
+		return keyOrder[i].icao < keyOrder[j].icao
+	})
+
+	result := make([]dailyAirportSummary, 0, len(keyOrder))
+	for _, k := range keyOrder {
+		acc := groups[k]
+		avg := acc.sumDelta / float64(acc.count)
+		result = append(result, dailyAirportSummary{
+			Date:         k.date,
+			ICAO:         k.icao,
+			AvgDelta:     avg,
+			ATH:          acc.maxTemp,
+			ATL:          acc.minTemp,
+			DiurnalRange: acc.maxTemp - acc.minTemp,
+			Count:        acc.count,
+		})
+	}
+
+	return result
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -486,6 +646,8 @@ func boolStr(v bool) string {
 	return "—"
 }
 
+// classifyAbsDelta labels an absolute delta value.
+// Thresholds match monitor.ClassifyDelta.
 func classifyAbsDelta(ad float64) string {
 	switch {
 	case ad < 0.5:
@@ -509,16 +671,5 @@ func assessBias(s storage.BiasStats) string {
 		return "NEEDS REVIEW"
 	default:
 		return "ACCEPTABLE"
-	}
-}
-
-func dailyQuality(avgAbsErr float64) string {
-	switch {
-	case avgAbsErr < 0.5:
-		return "EXCELLENT"
-	case avgAbsErr < 1.0:
-		return "GOOD"
-	default:
-		return "POOR"
 	}
 }
