@@ -55,6 +55,10 @@ type Engine struct {
 	states   map[string]*WeatherState
 	pressure map[string]*PressureTracker
 
+	// lastRaw stores the most recently seen raw METAR string per airport.
+	// A new WeatherLog is only created when this value changes, which
+	// prevents duplicate rows when the poll interval is shorter than the
+	// METAR publication cadence (~30-60 min for routine, instant for SPECI).
 	lastRaw   map[string]string
 	lastRawMu sync.RWMutex
 
@@ -148,8 +152,18 @@ func (e *Engine) tick() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Per-airport processing — event-driven logging
+// Per-airport processing — event-driven (METAR-change only) logging
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// Dedup strategy:
+//   1. Fetch the latest METAR from NOAA.
+//   2. Compare the FULL raw string against the last-seen value.
+//   3. If IDENTICAL → update in-memory state/pressure only, skip DB + Telegram.
+//   4. If DIFFERENT → log to DB, send notification, update last-seen.
+//
+// This means the DB only gets a new row when an actual new observation is
+// published. Typical METAR cadence is every 30-60 minutes per airport, so
+// with 11 airports you get ~350-530 rows/day instead of ~15,000.
 
 func (e *Engine) processAirport(apt storage.Airport) {
 	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.FetchTimeout)
@@ -165,18 +179,21 @@ func (e *Engine) processAirport(apt storage.Airport) {
 		return
 	}
 
-	// ── Event-driven: only process when the raw text changes ────────────
+	// ── Dedup: skip if the raw METAR string is unchanged ────────────────
+	//
+	// Even state + pressure are updated so tracking stays current,
+	// but NO database row is written and NO Telegram message is sent.
 
-	metarChanged := e.hasRawChanged(apt.ICAO, obs.Raw)
-	if !metarChanged {
-		// Still update state and pressure even when no new observation.
+	if !e.hasRawChanged(apt.ICAO, obs.Raw) {
 		e.ensureState(apt.ICAO, monitorApt)
 		_ = e.states[apt.ICAO].Update(obs.TempCelsius, monitorApt)
 		if obs.HasPressure {
 			e.pressure[apt.ICAO].Record(time.Now(), obs.PressureHpa)
 		}
-		return
+		return // ← nothing new, skip DB + notification
 	}
+
+	// ── New observation detected — proceed with full processing ─────────
 
 	e.setLastRaw(apt.ICAO, obs.Raw)
 
@@ -185,9 +202,6 @@ func (e *Engine) processAirport(apt storage.Airport) {
 	ff, forecastSource := e.getOrFetchForecast(ctx, apt.ICAO, monitorApt)
 
 	// ── Delta = Reality − Forecast ──────────────────────────────────────
-	//
-	//   Positive → reality warmer than predicted
-	//   Negative → reality colder than predicted
 
 	var forecastTemp, delta float64
 	var condition string
@@ -219,7 +233,7 @@ func (e *Engine) processAirport(apt storage.Airport) {
 	}
 	sensorWarnings := CheckSensorBias(obs, currentExt)
 
-	// ── Update state + pressure ─────────────────────────────────────────
+	// ── Update in-memory state + pressure ───────────────────────────────
 
 	e.ensureState(apt.ICAO, monitorApt)
 
@@ -229,10 +243,12 @@ func (e *Engine) processAirport(apt storage.Airport) {
 
 	_ = e.states[apt.ICAO].Update(obs.TempCelsius, monitorApt)
 
-	// ── Persist to DB ───────────────────────────────────────────────────
+	// ── Persist to DB (only reached when METAR changed) ─────────────────
 	//
 	// Delta stored as Reality − Forecast so downstream analytics
-	// (Excel, bias reports) interpret the sign consistently.
+	// (Excel, bias reports) interpret the sign consistently:
+	//   + means reality warmer than forecast
+	//   - means reality cooler than forecast
 
 	wlog := &storage.WeatherLog{
 		AirportICAO:     apt.ICAO,
@@ -256,6 +272,11 @@ func (e *Engine) processAirport(apt storage.Airport) {
 	// ── Skip notification for muted airports ────────────────────────────
 
 	if apt.IsMuted {
+		label := "METAR"
+		if obs.IsSpeci {
+			label = "⚡SPECI"
+		}
+		log.Printf("[engine][%s] %s logged (muted, skipping notification)", apt.ICAO, label)
 		return
 	}
 
@@ -293,7 +314,6 @@ func (e *Engine) getOrFetchForecast(
 	ctx context.Context, icao string, apt Airport,
 ) (*FullForecast, string) {
 
-	// Try DB cache first.
 	cached, err := storage.GetForecastCache(e.db, icao)
 	if err == nil && storage.IsForecastCacheFresh(cached, ForecastCacheTTL) {
 		ff, parseErr := ParseForecastJSON(cached.ResponseJSON, apt)
@@ -304,11 +324,9 @@ func (e *Engine) getOrFetchForecast(
 		log.Printf("[engine][%s] cache parse: %v", icao, parseErr)
 	}
 
-	// Cache miss or stale — fetch from Open-Meteo API.
 	rawJSON, fetchErr := FetchOpenMeteoRawJSON(ctx, apt)
 	if fetchErr != nil {
 		log.Printf("[engine][%s] forecast API: %v", icao, fetchErr)
-		// Fall back to stale cache if available.
 		if cached != nil && cached.ResponseJSON != "" {
 			ff, parseErr := ParseForecastJSON(cached.ResponseJSON, apt)
 			if parseErr == nil {
@@ -319,7 +337,6 @@ func (e *Engine) getOrFetchForecast(
 		return nil, "unavailable"
 	}
 
-	// Store fresh response in cache.
 	_ = storage.UpsertForecastCache(e.db, icao, rawJSON)
 
 	ff, parseErr := ParseForecastJSON(rawJSON, apt)
@@ -518,10 +535,9 @@ func buildFullMessage(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Engine-local helpers (wind formatting for Telegram)
+// Wind formatting (Telegram-specific, includes m/s conversion)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// fmtWind formats wind for the Telegram message with m/s conversion.
 func fmtWind(obs *Observation) string {
 	if obs.WindSpeed == 0 && obs.WindGust == 0 {
 		return "Calm"
@@ -567,6 +583,9 @@ func (e *Engine) ensureState(icao string, apt Airport) {
 	}
 }
 
+// hasRawChanged returns true if the raw METAR string differs from the
+// last-seen value for this airport, or if no previous value exists
+// (first poll after startup).
 func (e *Engine) hasRawChanged(icao, raw string) bool {
 	e.lastRawMu.RLock()
 	defer e.lastRawMu.RUnlock()
