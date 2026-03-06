@@ -390,41 +390,56 @@ func (app *App) registerHandlers() {
 			return c.Send(fmt.Sprintf("❌ METAR fetch failed: %v", err))
 		}
 
-		// ── Fetch forecast from Open-Meteo ──────────────────────────────
+		// ── Fetch full forecast (includes daily highs) ──────────────────
 
-		fc, _ := monitor.FetchForecast(ctx, monitorApt)
+		ff, _ := monitor.FetchFullForecastFromAPI(ctx, monitorApt)
 
 		// ── Delta = Reality − Forecast ──────────────────────────────────
 
 		var forecastTemp, delta float64
 		var condition string
 
-		if fc != nil {
-			forecastTemp = fc.TempCelsius
-			delta = monitor.CalculateDelta(obs.TempCelsius, fc.TempCelsius)
+		if ff != nil && ff.CurrentHour != nil {
+			forecastTemp = ff.CurrentHour.TempCelsius
+			delta = monitor.CalculateDelta(obs.TempCelsius, forecastTemp)
 			condition = monitor.ClassifyDelta(delta)
 		} else {
 			condition = "NoForecast"
 		}
 
+		// ── Daily forecast context for ATH analysis ─────────────────────
+
+		var forecastDailyHigh, forecastNextHigh float64
+
+		if ff != nil {
+			if ff.HasDailyExtremes {
+				forecastDailyHigh = ff.DailyMax
+			}
+			if ff.HasTomorrowExtremes {
+				forecastNextHigh = ff.TomorrowMax
+			}
+		}
+
 		// ── Save to DB ──────────────────────────────────────────────────
 
 		wlog := &storage.WeatherLog{
-			AirportICAO:  apt.ICAO,
-			Timestamp:    time.Now().UTC(),
-			ForecastTemp: forecastTemp,
-			RealTemp:     obs.TempCelsius,
-			Delta:        delta,
-			Condition:    condition,
-			IsSpeci:      obs.IsSpeci,
-			WindSpeed:    monitor.KnotsToMS(obs.WindSpeed),
-			RawMETAR:     obs.Raw,
+			AirportICAO:       apt.ICAO,
+			Timestamp:         time.Now().UTC(),
+			ForecastTemp:      forecastTemp,
+			RealTemp:          obs.TempCelsius,
+			Delta:             delta,
+			Condition:         condition,
+			IsSpeci:           obs.IsSpeci,
+			WindSpeed:         monitor.KnotsToMS(obs.WindSpeed),
+			ForecastDailyHigh: forecastDailyHigh,
+			ForecastNextHigh:  forecastNextHigh,
+			RawMETAR:          obs.Raw,
 		}
 		_ = storage.InsertWeatherLog(app.db, wlog)
 
 		// ── Build and send report ───────────────────────────────────────
 
-		msg := formatCheckReport(apt, obs, fc, delta, condition)
+		msg := formatCheckReport(apt, obs, ff, delta, condition)
 
 		return c.Send(msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 	})
@@ -444,7 +459,13 @@ func (app *App) registerHandlers() {
 			return c.Send("📭 No weather data recorded yet.")
 		}
 
-		xlFile, err := services.GenerateReport(logs)
+		// Fetch airport list for timezone-aware grouping.
+		airports, err := storage.ListAirports(app.db)
+		if err != nil {
+			return c.Send(fmt.Sprintf("❌ Failed to load airports: %v", err))
+		}
+
+		xlFile, err := services.GenerateReport(logs, airports)
 		if err != nil {
 			return c.Send(fmt.Sprintf("❌ Report generation failed: %v", err))
 		}
@@ -462,7 +483,7 @@ func (app *App) registerHandlers() {
 		doc := &tele.Document{
 			File:     tele.FromReader(buf),
 			FileName: fileName,
-			Caption:  fmt.Sprintf("📊 Weather report — %d records (30 days)", len(logs)),
+			Caption:  fmt.Sprintf("📊 Weather report — %d records (30 days, 4 sheets)", len(logs)),
 		}
 
 		return c.Send(doc)
@@ -488,11 +509,9 @@ func (app *App) registerHandlers() {
 		}
 
 		// Estimate daily API calls.
-		// With event-driven logging, actual DB writes are ~24-48 per airport/day.
-		// API calls still happen every poll interval for METAR check.
 		pollsPerDay := 86400 / int(app.cfg.PollInterval.Seconds())
 		metarCallsPerDay := pollsPerDay * len(airports)
-		// Forecast is cached for 3h, so ~8 calls/day per airport max.
+		// Forecast cached for 3h → ~8 calls/day per airport max.
 		forecastCallsPerDay := 8 * len(airports)
 
 		status := fmt.Sprintf(`📊 *Pogodnik Status*
@@ -504,7 +523,8 @@ func (app *App) registerHandlers() {
 • Est. METAR checks/day: ~%d
 • Est. forecast API/day: ~%d
 • Database: %s
-• Logging: event-driven (on METAR change only)`,
+• Logging: event-driven (on METAR change only)
+• Report sheets: Raw Data, Bias, Daily Summary, ATH Analysis`,
 			len(airports), muted,
 			totalLogs,
 			recentCount,
@@ -525,12 +545,12 @@ func (app *App) registerHandlers() {
 func formatCheckReport(
 	apt *storage.Airport,
 	obs *monitor.Observation,
-	fc *monitor.HourlyForecast,
+	ff *monitor.FullForecast,
 	delta float64,
 	condition string,
 ) string {
 	var b strings.Builder
-	b.Grow(1000)
+	b.Grow(1200)
 
 	loc, err := time.LoadLocation(apt.Timezone)
 	if err != nil {
@@ -595,22 +615,61 @@ func formatCheckReport(
 	//   + means reality warmer
 	//   - means reality colder
 
-	if fc != nil {
+	if ff != nil && ff.CurrentHour != nil {
 		b.WriteString("🎯 *Forecast vs Reality*\n```\n")
-		b.WriteString(fmt.Sprintf("Forecast    : %s\n", monitor.FormatTemp(fc.TempCelsius)))
+		b.WriteString(fmt.Sprintf("Forecast    : %s\n",
+			monitor.FormatTemp(ff.CurrentHour.TempCelsius)))
 		b.WriteString(fmt.Sprintf("Reality     : %s\n",
 			monitor.FormatTempWithPrecision(obs.TempCelsius, obs.IsPrecise)))
 		b.WriteString(fmt.Sprintf("Delta       : %s\n", monitor.FormatDelta(delta)))
 		b.WriteString(fmt.Sprintf("Verdict     : %s\n", monitor.FormatVerdict(delta)))
 		b.WriteString(fmt.Sprintf("Accuracy    : %s\n", condition))
-		b.WriteString("```\n")
+		b.WriteString("```\n\n")
 	} else {
-		b.WriteString("_Forecast not available_\n")
+		b.WriteString("_Forecast not available_\n\n")
+	}
+
+	// ── Daily Outlook ───────────────────────────────────────────────────
+
+	if ff != nil && len(ff.Upcoming) > 0 {
+		b.WriteString("🌤 *Hourly Outlook*\n```\n")
+		for _, hp := range ff.Upcoming {
+			localHour := hp.Time.In(loc)
+			b.WriteString(fmt.Sprintf("%s : %s\n",
+				localHour.Format("15:04"), monitor.FormatTemp(hp.TempCelsius)))
+		}
+		b.WriteString("```\n\n")
+	}
+
+	// ── Daily Highs / Lows ──────────────────────────────────────────────
+
+	if ff != nil && ff.HasDailyExtremes {
+		b.WriteString("📊 *Daily Extremes (Forecast)*\n```\n")
+		b.WriteString(fmt.Sprintf("Today High  : %s\n", monitor.FormatTemp(ff.DailyMax)))
+		b.WriteString(fmt.Sprintf("Today Low   : %s\n", monitor.FormatTemp(ff.DailyMin)))
+
+		if ff.HasTomorrowExtremes {
+			b.WriteString(fmt.Sprintf("Tmrw High   : %s\n", monitor.FormatTemp(ff.TomorrowMax)))
+			b.WriteString(fmt.Sprintf("Tmrw Low    : %s\n", monitor.FormatTemp(ff.TomorrowMin)))
+
+			diffMax := ff.TomorrowMax - ff.DailyMax
+			maxArrow := "→"
+			if diffMax > 0.5 {
+				maxArrow = "↑ warmer"
+			} else if diffMax < -0.5 {
+				maxArrow = "↓ cooler"
+			}
+
+			b.WriteString(fmt.Sprintf("\nTomorrow vs Today:\n"))
+			b.WriteString(fmt.Sprintf("  High %+.1f°C (%s)\n", diffMax, maxArrow))
+		}
+
+		b.WriteString("```\n\n")
 	}
 
 	// ── Raw METAR ───────────────────────────────────────────────────────
 
-	b.WriteString(fmt.Sprintf("\n📋 `%s`", obs.Raw))
+	b.WriteString(fmt.Sprintf("📋 `%s`", obs.Raw))
 
 	return b.String()
 }
