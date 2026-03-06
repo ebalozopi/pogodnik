@@ -28,13 +28,12 @@ type Airport struct {
 func (Airport) TableName() string { return "airports" }
 
 // WeatherLog is the core analytics record. Each row represents a single
-// event: the moment a new METAR/SPECI was detected and a notification
-// was triggered.
+// event: the moment a new METAR/SPECI was detected and logged.
 //
-// Delta semantics: Forecast − Reality.
+// Delta semantics: Reality − Forecast.
 //
-//	Positive delta → forecast was warmer than reality (warm bias).
-//	Negative delta → forecast was cooler than reality (cool bias).
+//	Positive delta → reality was warmer than forecast.
+//	Negative delta → reality was cooler than forecast.
 type WeatherLog struct {
 	ID           uint      `gorm:"primaryKey;autoIncrement"                    json:"id"`
 	AirportICAO  string    `gorm:"column:airport_icao;size:4;not null;index"  json:"airport_icao"`
@@ -46,10 +45,22 @@ type WeatherLog struct {
 	IsSpeci      bool      `gorm:"column:is_speci;default:false"              json:"is_speci"`
 
 	// Contextual fields for bias analysis.
-	WindSpeed       float64 `gorm:"column:wind_speed"                          json:"wind_speed"`        // m/s (converted from kt)
-	DirectRadiation float64 `gorm:"column:direct_radiation"                    json:"direct_radiation"`  // W/m²
+	WindSpeed       float64 `gorm:"column:wind_speed"                          json:"wind_speed"`
+	DirectRadiation float64 `gorm:"column:direct_radiation"                    json:"direct_radiation"`
 	IsRaining       bool    `gorm:"column:is_raining;default:false"            json:"is_raining"`
 	IsFoggy         bool    `gorm:"column:is_foggy;default:false"              json:"is_foggy"`
+
+	// Daily forecast context captured at observation time.
+	// These come from the Open-Meteo Daily arrays and allow ATH analysis
+	// without needing to re-query the forecast API.
+	//
+	// ForecastDailyHigh = Daily.Temperature2mMax[0] (today's predicted max)
+	// ForecastNextHigh  = Daily.Temperature2mMax[1] (tomorrow's predicted max)
+	//
+	// A value of 0 may mean either "not available" or "literally 0°C".
+	// Use in conjunction with Condition != "NoForecast" to distinguish.
+	ForecastDailyHigh float64 `gorm:"column:forecast_daily_high"                json:"forecast_daily_high"`
+	ForecastNextHigh  float64 `gorm:"column:forecast_next_high"                 json:"forecast_next_high"`
 
 	// Raw observation for audit trail.
 	RawMETAR string `gorm:"column:raw_metar;type:TEXT"                  json:"raw_metar"`
@@ -92,14 +103,17 @@ func InitDB(path string) (*gorm.DB, error) {
 		return nil, fmt.Errorf("storage: enable FK: %w", err)
 	}
 
+	// AutoMigrate gracefully adds new columns (ForecastDailyHigh,
+	// ForecastNextHigh) without dropping existing data.
 	if err := db.AutoMigrate(&Airport{}, &WeatherLog{}, &ForecastCache{}); err != nil {
 		return nil, fmt.Errorf("storage: migrate: %w", err)
 	}
 
-	// Composite index for bias-analysis queries.
+	// Composite indices for analytics queries.
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_wl_icao_ts ON weather_logs(airport_icao, timestamp)")
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_wl_radiation ON weather_logs(direct_radiation)")
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_wl_raining ON weather_logs(is_raining)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_wl_forecast_high ON weather_logs(forecast_daily_high)")
 
 	return db, nil
 }
@@ -174,7 +188,7 @@ func RecentLogs(db *gorm.DB, icao string, limit int) ([]WeatherLog, error) {
 }
 
 // Last30DaysLogs returns all logs within the last 30 days, ordered by
-// timestamp ascending (oldest first) — ideal for reports.
+// timestamp ascending (oldest first). No row limit.
 func Last30DaysLogs(db *gorm.DB) ([]WeatherLog, error) {
 	cutoff := time.Now().Add(-30 * 24 * time.Hour)
 	var logs []WeatherLog
@@ -242,14 +256,14 @@ func PurgeForecastCache(db *gorm.DB, age time.Duration) (int64, error) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Aggregation helpers (used by excel.go and /status)
+// Aggregation helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
 // BiasStats holds pre-computed bias metrics for one airport.
 type BiasStats struct {
 	ICAO      string
 	Count     int
-	AvgBias   float64 // mean(forecast − reality)
+	AvgBias   float64 // mean(reality − forecast); positive = reality warmer
 	Excellent float64 // % within ±0.5°C
 	Good      float64 // % within ±1.0°C
 	Critical  float64 // % > 1.0°C error
@@ -262,6 +276,11 @@ type BiasStats struct {
 
 // ComputeBiasStats calculates all bias metrics from a slice of logs
 // belonging to a single airport.
+//
+// Delta convention: Reality − Forecast.
+//
+//	Positive AvgBias → reality is systematically warmer than forecast.
+//	Negative AvgBias → reality is systematically cooler than forecast.
 func ComputeBiasStats(icao string, logs []WeatherLog) BiasStats {
 	s := BiasStats{ICAO: icao}
 	if len(logs) == 0 {
@@ -276,7 +295,7 @@ func ComputeBiasStats(icao string, logs []WeatherLog) BiasStats {
 	var rainSum float64
 
 	for _, l := range logs {
-		d := l.Delta          // forecast − reality
+		d := l.Delta // reality − forecast
 		ad := abs64(d)
 		sumDelta += d
 
@@ -321,15 +340,18 @@ func ComputeBiasStats(icao string, logs []WeatherLog) BiasStats {
 }
 
 // DailySummary holds one day's aggregate error across all airports.
+// Kept for backwards compatibility; the Excel report now uses
+// timezone-aware per-airport grouping instead.
 type DailySummary struct {
 	Date        string
 	Count       int
 	AvgAbsError float64
 	MaxAbsError float64
-	AvgBias     float64
+	AvgBias     float64 // mean(reality − forecast)
 }
 
 // ComputeDailySummaries groups logs by UTC date and calculates daily stats.
+// Note: for timezone-aware grouping, use the functions in services/excel.go.
 func ComputeDailySummaries(logs []WeatherLog) []DailySummary {
 	type accumulator struct {
 		sumAbs  float64
